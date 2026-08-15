@@ -16,7 +16,9 @@ class PoseRelay(Node):
         super().__init__("ap_pose_relay")
         self.declare_parameter("parent_frame", "odom")
         self.declare_parameter("child_frame", "base_link")
-        self.declare_parameter("max_rate_hz", 25.0)
+        # Throttling adds staleness on top of the pipeline delay that
+        # EKF3 already has to compensate for, so keep this generous.
+        self.declare_parameter("max_rate_hz", 50.0)
         self.declare_parameter("ap_tf_topic", "/ap/v1/tf")
 
         self._parent = self.get_parameter("parent_frame").value

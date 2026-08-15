@@ -8,8 +8,10 @@ maze, explores it on its own, and lands when nothing is left to map —
 with **no GPS anywhere in the loop**. ArduPilot's EKF3 fuses
 Cartographer's SLAM pose as ExternalNav for position, velocity, and yaw.
 
-**Validated end to end in SITL**: a complete run maps ~224 m² of maze
-interior (the full navigable area), then lands and disarms by itself.
+**Validated end to end in SITL**: a complete run maps 257.6 m² of maze
+interior — essentially all of it — reaching 49 of 60 dispatched goals
+with no navigation stalls, then lands and disarms by itself. Peak
+localization error against Gazebo ground truth was 1.63 m.
 
 ## How it works
 
@@ -40,9 +42,11 @@ Pure NumPy, no ROS dependencies, so it is unit-testable in isolation.
 
 A frontier cell is a free cell of the occupancy grid that borders
 unknown space. Cells are clustered by 8-connectivity, and each cluster
-above a minimum size becomes a candidate whose goal is the frontier cell
-nearest the cluster centroid (so goals always sit on known-free ground
-even for concave clusters).
+above a minimum size becomes a candidate. Its goal is placed on a
+frontier cell with real clearance from walls, nearest the centroid among
+those — frontier cells border unknown space, which usually abuts a wall,
+so the centroid-nearest cell is often inside the costmap's inscribed
+radius where the planner cannot place the vehicle at all.
 
 Two details matter on real Cartographer maps and are the difference
 between this working and finding nothing at all:
@@ -67,15 +71,17 @@ dozen noise-sized ones.
 
 A state machine (`WAIT_INTERFACES → SET_MODE → ARM → TAKEOFF → CLIMB →
 EXPLORE → LAND → DONE`) driving the vehicle through the ArduPilot DDS
-services, plus a nearest-first frontier policy re-evaluated every
-`eval_period` seconds as the map updates:
+services, plus a frontier policy re-evaluated every `eval_period`
+seconds as the map updates:
 
-- The candidate nearest the vehicle is dispatched to Nav2 as a
+- The highest-utility candidate is dispatched to Nav2 as a
   `NavigateToPose` goal.
-- **Momentum**: when a goal is invalidated because its area got mapped
-  in transit, the successor is chosen nearest the *old goal* rather than
-  nearest the vehicle, so the copter keeps pushing outward instead of
-  flapping between opposite sides of the map.
+- **Utility, not proximity**: candidates are scored by unknown area
+  revealed per metre actually flown, with distance measured by a
+  breadth-first expansion around walls rather than in a straight line.
+  In a maze the two differ wildly — measured on a real map, the nearest
+  frontier by straight line needed 33 m of flying while another at the
+  same apparent distance needed 18 m.
 - **Preemption**: a goal whose frontier has been mapped away while in
   transit is cancelled and replaced.
 - **Blacklisting**: goals that Nav2 aborts, that time out, or that the
@@ -85,9 +91,13 @@ services, plus a nearest-first frontier policy re-evaluated every
   cleared for another attempt (twice) before exploration is declared
   finished — a frontier may be reachable from a vantage point discovered
   later.
-- **Boundary**: candidates outside `bound_*` are ignored. The maze world
-  has an opening in its outer wall, and without this the vehicle leaves
-  and explores the unbounded world outside forever.
+- **Boundary**: candidates outside `bound_*` are ignored, and the bounds
+  sit inside the outer wall. Note this guard is evaluated in the map
+  frame, so it fails exactly when SLAM diverges — it is a convenience,
+  not a safety mechanism. `worlds/maze_closed.sdf` is the real remedy:
+  the stock maze has a 3 m gap in its east wall, and outside the walls a
+  2D lidar has nothing to scan-match against, so the pose estimate
+  diverges and takes the map and EKF with it.
 - When no reachable candidate remains for `empty_evals_before_land`
   consecutive evaluations, the vehicle switches to LAND and the node
   reports the run summary once disarmed.
@@ -118,6 +128,28 @@ over MAVLink. Both are required: without home, arming fails with
 - **cmd_vel relay** (launch-only `topic_tools relay`) — the stock
   `twist_stamper` publishes to `/ap/cmd_vel`, but this ArduPilot build
   subscribes under `/ap/v1/cmd_vel`.
+- **`scripts/drift_check.py`** — prints Cartographer's estimate against
+  Gazebo ground truth. Worth running during any change to SLAM: a
+  divergent run still looks purposeful on screen while the map quietly
+  rots, and area figures *above* the true maze size are the tell.
+
+### SLAM configuration — `config/cartographer.lua`
+
+Two departures from the upstream `ardupilot_cartographer` config, both
+forced by the maze:
+
+- `ceres_scan_matcher` translation/rotation weights are restored to
+  Cartographer's defaults (10 / 40). Upstream uses 0.2 / 5, roughly
+  fifty times weaker, which lets the solution slide along a corridor —
+  scan matching is degenerate along the corridor axis, and the estimate
+  drifted over 6 m in one direction while staying centimetre-accurate
+  in the other.
+- Global loop closure is **disabled** (`optimize_every_n_nodes = 0`).
+  Every corridor looks like every other corridor, so the matcher finds
+  convincing but wrong correspondences and each accepted one rewrites
+  the trajectory. A deliberate trade: local drift now accumulates
+  uncorrected, which is tolerable in a bounded 20 m maze and would not
+  be in a large or looping environment.
 
 ## Requirements
 
@@ -154,14 +186,23 @@ cylinder.
 | `takeoff_alt` | 2.0 | Exploration altitude (m), below the 3.25 m maze walls |
 | `unknown_dilation` | 3 | Cells to dilate unknown space; must stay below the thinnest wall thickness in cells |
 | `min_frontier_size` | 10 | Smallest cluster treated as a real frontier |
-| `goal_invalidate_dist` | 1.0 | A goal is preempted when no frontier cell remains this close (m) |
+| `min_goal_clearance` | 0.5 | Keep goals this far (m) from walls, or the planner cannot place the vehicle there at all |
+| `gain_radius` | 6.0 | Radius (m) over which unknown area is counted when scoring a frontier |
+| `goal_invalidate_dist` | 1.5 | A goal is preempted when no frontier cell remains this close (m); kept in step with Nav2's `xy_goal_tolerance` |
 | `goal_timeout` | 90.0 | Blacklist a goal not reached within this many seconds |
 | `blacklist_radius` | 0.8 | Candidates within this distance (m) of a blacklisted point are skipped |
 | `empty_evals_before_land` | 5 | Consecutive empty evaluations before landing |
-| `bound_min/max_x/y` | ±11.0 | Exploration boundary in the map frame |
+| `bound_min/max_x/y` | ±9.5 | Exploration boundary in the map frame — must sit *inside* the ±10 m outer wall |
 | `ap_ns` | `/ap/v1` | ArduPilot DDS namespace |
 
-Nav2 tuning lives in `config/navigation.yaml`. The inflation radius
+Nav2 tuning lives in `config/navigation.yaml`. Two settings there
+matter more than the rest. `xy_goal_tolerance` is 1.5 m and
+`yaw_goal_tolerance` is unconstrained: a frontier is a region to get
+the sensor near, not a pose to hit, and with a 360° lidar the heading
+is irrelevant. Demanding tighter arrival caused the vehicle to hover
+short of goals it had effectively reached, cycle through Nav2
+recoveries and abort — arrivals rose from 4% to 81% of goals when this
+was relaxed. The inflation radius
 (0.7 m) and speed cap (0.4 m/s) are deliberately conservative: with the
 stock values the copter clips maze corners and ArduPilot triggers its
 crash detector (`Crash: Disarming: AngErr=44>30`).

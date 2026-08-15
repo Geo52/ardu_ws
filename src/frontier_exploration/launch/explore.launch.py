@@ -43,24 +43,51 @@ def generate_launch_description():
         ]
     )
 
-    # Gazebo + SITL + DDS agent. Gazebo ground-truth TF is disabled:
+    # Gazebo is started directly rather than through
+    # ardupilot_gz_bringup's iris_maze.launch.py, which hardcodes the
+    # stock maze world. That world's east wall is 3 m short, and
+    # autonomous exploration reliably escapes through the gap; outside
+    # the walls a 2D lidar has nothing to scan-match against, so
+    # Cartographer diverges and takes the map, the EKF pose and the
+    # boundary check down with it. worlds/maze_closed.sdf seals it.
+    # The world is still named "maze" so the ros_gz bridge topic
+    # templates ({{ world_name }}) resolve unchanged.
+    pkg_ros_gz_sim = get_package_share_directory("ros_gz_sim")
+    world = os.path.join(pkg_self, "worlds", "maze_closed.sdf")
+
+    gz_server = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(pkg_ros_gz_sim, "launch", "gz_sim.launch.py")
+        ),
+        launch_arguments={"gz_args": f"-v4 -s -r {world}"}.items(),
+    )
+
+    gz_gui = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(pkg_ros_gz_sim, "launch", "gz_sim.launch.py")
+        ),
+        launch_arguments={"gz_args": "-v4 -g"}.items(),
+        condition=IfCondition(LaunchConfiguration("gui")),
+    )
+
+    # Iris + SITL + DDS agent. Gazebo ground-truth TF is disabled:
     # odom->base_link must come from Cartographer alone, both for Nav2
     # and for the ExternalNav feedback to EKF3.
-    sim = IncludeLaunchDescription(
+    robot = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
-            os.path.join(pkg_gz_bringup, "launch", "iris_maze.launch.py")
+            os.path.join(
+                pkg_gz_bringup, "launch", "robots", "iris_lidar.launch.py"
+            )
         ),
         launch_arguments={
-            "rviz": "false",
             "use_gz_tf": "false",
-            "use_gz_sim_gui": LaunchConfiguration("gui"),
+            "world_name": "maze",
             "defaults": defaults,
         }.items(),
     )
 
     # Cartographer is launched directly (not via ardupilot_cartographer)
-    # so it picks up this package's config: scan-matching only, no
-    # ground-truth odometry prior from the simulator.
+    # so it picks up this package's config.
     cartographer = TimerAction(
         period=4.0,
         actions=[
@@ -68,7 +95,11 @@ def generate_launch_description():
                 package="frontier_exploration",
                 executable="odom_sanitizer",
                 output="screen",
-                parameters=[{"use_sim_time": True}],
+                # No sim time: this node only compares stamps carried by
+                # the messages themselves. Subscribing to /clock, which
+                # Gazebo publishes at 1 kHz, costs ~half a core in rclpy
+                # and starves Nav2's control loop.
+                parameters=[{"use_sim_time": False}],
             ),
             Node(
                 package="cartographer_ros",
@@ -134,7 +165,10 @@ def generate_launch_description():
         package="frontier_exploration",
         executable="pose_relay",
         output="screen",
-        parameters=[{"use_sim_time": True}],
+        # No sim time: transforms are forwarded with their original
+        # stamps and the clock is only read for rate limiting. See the
+        # odom_sanitizer note on /clock at 1 kHz.
+        parameters=[{"use_sim_time": False}],
     )
 
     # The stock twist_stamper (ardupilot_cartographer) publishes velocity
@@ -179,7 +213,9 @@ def generate_launch_description():
                 default_value="2.0",
                 description="Exploration altitude in meters.",
             ),
-            sim,
+            gz_server,
+            gz_gui,
+            robot,
             cartographer,
             navigation,
             pose_relay,

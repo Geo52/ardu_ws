@@ -17,6 +17,16 @@ EK3_SRC1_YAW 6
 # Enable the visual odometry backend fed by AP_DDS.
 VISO_TYPE 1
 
+# Tolerances for a SLAM pose arriving over a long software pipeline
+# (Gazebo -> lidar -> Cartographer scan match -> tf -> relay -> DDS).
+# The defaults (10 ms delay, 0.2 m position noise) assume a tightly
+# coupled sensor; with them EKF3 eventually declares "variance:
+# position lost", failsafes to LAND, and the vehicle crashes mid-run.
+VISO_DELAY_MS 80
+VISO_POS_M_NSE 0.5
+VISO_VEL_M_NSE 0.3
+VISO_YAW_M_NSE 0.3
+
 # Remove GPS entirely (driver and simulated sensor).
 GPS1_TYPE 0
 SIM_GPS1_ENABLE 0

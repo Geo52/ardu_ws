@@ -137,6 +137,73 @@ def test_line_of_sight_keeps_open_frontiers():
     assert len(fs) == 1
 
 
+def test_line_of_sight_not_blocked_by_partially_observed_cells():
+    from frontier_exploration.frontier_search import find_frontiers
+
+    # Regression: partially-observed cells around a frontier reach ~80
+    # on real Cartographer maps. Treating those as walls blocks every
+    # ray and rejects every frontier, which ended a run after 34 s.
+    grid = make_grid(12, 14, fill=-1)
+    grid[:, :5] = 0
+    grid[:, 5:7] = 80  # fog, not a wall
+    fs = find_frontiers(
+        grid, min_size=3, unknown_dilation=3, require_line_of_sight=True
+    )
+    assert len(fs) == 1
+
+
+def test_travel_distance_goes_around_walls():
+    from frontier_exploration.frontier_search import travel_distances
+
+    # A wall splits the grid; the cell just beyond it is near in a
+    # straight line but far to travel, via a gap at the bottom.
+    grid = make_grid(40, 40, fill=0)
+    grid[:36, 20] = 100  # wall with a gap at rows 36-39
+    dist = travel_distances(grid, (4, 16), downsample=1)
+
+    near_euclid = dist[4, 24]   # 8 cells away in a straight line
+    same_side = dist[30, 16]    # 26 cells away, no wall between
+    assert np.isfinite(near_euclid)
+    assert near_euclid > same_side, "must route around the wall, not through"
+
+
+def test_travel_distance_marks_unreachable():
+    from frontier_exploration.frontier_search import travel_distances
+
+    grid = make_grid(30, 30, fill=0)
+    grid[:, 15] = 100  # solid wall, no gap
+    dist = travel_distances(grid, (5, 5), downsample=1)
+    assert np.isfinite(dist[5, 5])
+    assert not np.isfinite(dist[5, 25]), "other side must be unreachable"
+
+
+def test_unknown_gain_counts_nearby_unknown():
+    from frontier_exploration.frontier_search import unknown_gain
+
+    grid = make_grid(40, 40, fill=0)
+    grid[:, 30:] = -1  # a block of unknown on the right
+    gain = unknown_gain(grid, radius_cells=5)
+
+    # Deep in known space, nothing unknown is in range.
+    assert gain[20, 5] == 0
+    # Right at the boundary, part of the window is unknown.
+    assert gain[20, 28] > 0
+    # Inside the unknown region, the window is mostly unknown.
+    assert gain[20, 35] > gain[20, 28]
+
+
+def test_unknown_gain_matches_bruteforce():
+    from frontier_exploration.frontier_search import unknown_gain
+
+    rng = np.random.default_rng(0)
+    grid = rng.choice([-1, 0, 100], size=(25, 25)).astype(np.int8)
+    r = 3
+    gain = unknown_gain(grid, radius_cells=r)
+    for (row, col) in [(0, 0), (12, 12), (24, 24), (5, 20)]:
+        window = grid[max(0, row - r):row + r + 1, max(0, col - r):col + r + 1]
+        assert gain[row, col] == (window == -1).sum()
+
+
 def test_cluster_direct_call():
     mask = np.zeros((10, 10), dtype=bool)
     mask[2, 2:8] = True  # a 6-cell line

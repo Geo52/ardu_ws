@@ -68,26 +68,63 @@ controller_server:
     controller_plugins: ["FollowPath"]
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.5
-      movement_time_allowance: 10.0
+      # A multicopter under GUIDED velocity control accelerates and
+      # turns far more slowly than the ground robots these defaults
+      # assume, so the stock 0.5 m / 10 s trips constantly and sends
+      # the vehicle into recovery spins.
+      required_movement_radius: 0.3
+      movement_time_allowance: 15.0
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.25
-      yaw_goal_tolerance: 0.25
+      # The lidar is 360 degrees, so the vehicle senses the same thing
+      # whichever way it faces: demanding a final heading buys nothing
+      # and costs a slow yaw manoeuvre the copter often cannot complete
+      # within tolerance. It then never registers arrival, the progress
+      # checker trips, and the goal dies after a cycle of recoveries.
+      # Heading is therefore unconstrained.
+      #
+      # The goal is likewise a region, not a pose: stopping half a
+      # metre from a frontier still lets the lidar see past it.
+      xy_goal_tolerance: 1.5
+      yaw_goal_tolerance: 3.15
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
-      max_vel_x: 0.4
-      max_vel_y: 0.4
+      # 0.4 m/s repeatedly clipped corners in 1.2-2 m corridors. DWB
+      # is a ground-robot controller and does not model the copter's
+      # momentum, so the practical remedy is time to react. Slower
+      # runs, but coverage is limited by sensing rather than speed.
+      max_vel_x: 0.7
+      max_vel_y: 0.7
       max_vel_theta: 1.0
-      max_speed_xy: 0.5
+      max_speed_xy: 0.8
+      # DWB plans assuming it gets the acceleration it asks for. At
+      # 2.5 m/s2 it planned turns this copter cannot track under
+      # GUIDED velocity control, so it overshot and clipped the *edge*
+      # of a wall -- rounding a convex corner leaves no inflation band
+      # to absorb the error, unlike running alongside a flat wall.
+      # 1.0 makes DWB plan turns the vehicle can actually fly.
       acc_lim_x: 2.5
+      # A quadcopter is holonomic and can strafe. The upstream config
+      # left lateral acceleration at 0, which describes a
+      # differential-drive ground robot: DWB could then never sample a
+      # sideways trajectory, so every corner became stop-yaw-go, and
+      # yaw under GUIDED velocity control is slow enough that the
+      # vehicle visibly hangs at each turn.
       acc_lim_y: 0.0
       acc_lim_theta: 3.2
       decel_lim_x: -2.5
       decel_lim_y: 0.0
       decel_lim_theta: -3.2
       critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
+      # Every critic defaults to scale 1.0, which leaves obstacle
+      # avoidance (BaseObstacle, one critic) outvoted by four critics
+      # all pulling toward the goal. The copter clipped the same wall
+      # edge near (5, 2) in several runs. Weight avoidance above
+      # path-following; too high and it refuses to enter corridors, so
+      # this is deliberately below the goal critics' combined pull.
+      # BaseObstacle.scale left at default: raising it was part of the
+      # controller changes that coincided with edge strikes.
 
 global_costmap:
   global_costmap:
@@ -114,7 +151,25 @@ global_costmap:
           data_type: "LaserScan"
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        inflation_radius: 0.7
+        # Radius stays wide so planned paths prefer corridor centres,
+        # but the cost must decay fast or the whole corridor becomes
+        # expensive and the controller freezes. Measured: a vehicle at
+        # 0.75 m clearance saw cost 76/253 at scaling 3.0 and could not
+        # find an affordable escape trajectory. 10.0 fixed that but
+        # gutted close-range repulsion (0.55 m: 138 -> 34) and the
+        # vehicle struck a wall. 6.0 keeps both: 0.55 m -> 76 still
+        # repels, 0.75 m -> 23 still lets it move.
+        # Centring: the planner minimises cost, so if the inflation
+        # gradients from both walls overlap there is a single cheapest
+        # ridge down the corridor centre and the path follows it. At
+        # 0.7 m the gradient reached only two thirds of the way in
+        # (median corridor half-width here is 1.10 m), leaving a flat
+        # uncosted plateau in the middle: the path had no reason to
+        # centre and arrived at turns already hugging one side, with
+        # no room to swing. 1.0 m overlaps the gradients. Decay stays
+        # gentle (3.0) -- steep decay flattens the middle again and
+        # destroys the very centring this is for.
+        inflation_radius: 1.0
         cost_scaling_factor: 3.0
 
 local_costmap:
@@ -141,7 +196,25 @@ local_costmap:
           data_type: "LaserScan"
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        inflation_radius: 0.7
+        # Radius stays wide so planned paths prefer corridor centres,
+        # but the cost must decay fast or the whole corridor becomes
+        # expensive and the controller freezes. Measured: a vehicle at
+        # 0.75 m clearance saw cost 76/253 at scaling 3.0 and could not
+        # find an affordable escape trajectory. 10.0 fixed that but
+        # gutted close-range repulsion (0.55 m: 138 -> 34) and the
+        # vehicle struck a wall. 6.0 keeps both: 0.55 m -> 76 still
+        # repels, 0.75 m -> 23 still lets it move.
+        # Centring: the planner minimises cost, so if the inflation
+        # gradients from both walls overlap there is a single cheapest
+        # ridge down the corridor centre and the path follows it. At
+        # 0.7 m the gradient reached only two thirds of the way in
+        # (median corridor half-width here is 1.10 m), leaving a flat
+        # uncosted plateau in the middle: the path had no reason to
+        # centre and arrived at turns already hugging one side, with
+        # no room to swing. 1.0 m overlaps the gradients. Decay stays
+        # gentle (3.0) -- steep decay flattens the middle again and
+        # destroys the very centring this is for.
+        inflation_radius: 1.0
         cost_scaling_factor: 3.0
 
 planner_server:
@@ -152,7 +225,12 @@ planner_server:
     GridBased:
       plugin: "nav2_navfn_planner/NavfnPlanner"
       tolerance: 0.5
-      allow_unknown: false
+      # Must be true for frontier exploration. Frontier goals sit by
+      # definition at the edge of unknown space, so with unknown
+      # treated as an obstacle the inflation around it engulfs the
+      # goal and NavFn refuses to plan: 10 of 15 goals failed with
+      # "Planning algorithm GridBased failed to create plan".
+      allow_unknown: true
 
 smoother_server:
   ros__parameters:
@@ -183,6 +261,6 @@ velocity_smoother:
   ros__parameters:
     use_sim_time: *default_use_sim_time
     feedback: "OPEN_LOOP"
-    max_velocity: [0.5, 0.5, 1.0]
-    min_velocity: [-0.5, -0.5, -1.0]
+    max_velocity: [0.8, 0.8, 1.0]
+    min_velocity: [-0.8, -0.8, -1.0]
     velocity_timeout: 1.0

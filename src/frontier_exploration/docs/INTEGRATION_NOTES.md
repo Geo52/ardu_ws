@@ -222,18 +222,258 @@ exploration mission needs a boundary.
 
 ---
 
-## 12. Nav2 clips corners and ArduPilot's crash detector fires
+## 12. Three different crashes that all print the same message
 
-**Symptom.** `Crash: Disarming: AngErr=44>30, Accel=0.0<3.0` mid-flight,
-followed by `Arm: Leaning` refusing to re-arm.
+`Crash: Disarming: AngErr=NN>30` is ArduPilot's crash detector, and it
+is the *last* line of three unrelated failures. Diagnosing it means
+reading what came immediately before it, not the message itself.
 
-**Cause.** With stock inflation and a 0.5–0.7 m/s speed cap, paths hug
-maze corners closely enough that the copter strikes a wall.
+**(a) EKF failsafe.** The give-away is EKF chatter preceding it:
 
-**Fix.** In `config/navigation.yaml`: `inflation_radius: 0.7`,
-`cost_scaling_factor: 3.0` on both costmaps, `max_vel_x/y: 0.4`,
-`max_speed_xy: 0.5`, and `allow_unknown: false` on the planner so paths
-never route through unmapped space.
+```
+EKF3 lane switch 1  ->  EKF variance: position lost
+  ->  EKF Failsafe: changed to Land Mode  ->  EKF3 IMU0 stopped aiding
+  ->  Crash: Disarming: AngErr=64>30
+```
+
+The vehicle lost its position solution and fell; the attitude error is
+a consequence, not a cause. Look upstream at the ExternalNav pose
+(entries 13 and 14 below).
+
+**(b) The host suspended.** Closing a laptop lid freezes every process
+at once. Cartographer stops publishing, EKF3 sees its only position
+source vanish, and the same failsafe chain runs. Nothing in the
+software can survive this — run long simulations under
+`systemd-inhibit --what=handle-lid-switch:sleep:idle`.
+
+**(c) An actual wall strike.** No EKF messages at all, just arm,
+takeoff, then `AngErr=85>30, Accel=0.1<3.0`. The low acceleration
+alongside a large attitude error means the vehicle is lodged against
+geometry rather than falling freely.
+
+**On inflation, honestly.** Only (c) is a navigation-tuning problem,
+and it is a genuine tradeoff rather than a bug with a right answer.
+Measured on this maze, a quarter of the navigable area has under 0.6 m
+of wall clearance, so `inflation_radius: 0.7` puts entire corridors
+inside the cost gradient and the controller stalls with `Failed to make
+progress`. Dropping to 0.5 removes the stalls and produced a wall
+strike within a minute. The setting shipped is 0.7 — occasional stalls
+are cheaper than crashes — but the real problem is that DWB is a
+ground-robot controller flying a multicopter: it assumes velocity
+commands are tracked almost immediately, while the copter banks and
+overshoots corners. Matching DWB's acceleration limits to the vehicle,
+or using a controller aware of its dynamics, is the correct fix and
+was not attempted here.
+
+---
+
+## 13. Scan matching slides down corridors when the prior is under-weighted
+
+**Symptom.** Exploration looked excellent — 205 m² mapped in eight
+minutes — while Cartographer's pose quietly diverged from ground truth:
+3.1 m, then 4.6, 5.0, 6.2 m, growing monotonically. Critically, the
+error was almost entirely along **one axis**; the perpendicular axis
+stayed accurate to a few centimetres throughout.
+
+**Cause.** That asymmetry is the fingerprint of scan-matching
+degeneracy. Travelling down a long corridor, the lidar sees the same
+two parallel walls no matter how far along you are, so the geometry
+does not constrain longitudinal position at all. The motion prior is
+what holds the estimate steady through such stretches — and the
+inherited `ardupilot_cartographer` config weights it at
+
+```lua
+TRAJECTORY_BUILDER_2D.ceres_scan_matcher.translation_weight = 0.2  -- default 10
+TRAJECTORY_BUILDER_2D.ceres_scan_matcher.rotation_weight    = 5    -- default 40
+```
+
+roughly fifty times below Cartographer's defaults, so the optimiser is
+free to slide the solution along the degenerate direction.
+
+**Fix.** Restore the defaults (10 / 40).
+
+**Caveat worth stating.** `use_odometry = true`, and in simulation the
+odometry the `ros_gz` bridge supplies is Gazebo ground truth. Leaning
+harder on that prior is therefore flattering: on real hardware the
+prior would be IMU or visual-inertial odometry, which is standard
+practice but not free. The SLAM here is not purely lidar-derived.
+
+**Why it went unnoticed for so long.** Nothing in the ROS logs
+complains. The map looks plausible in RViz, the vehicle flies
+purposefully, and the explorer happily plans against a corrupted map —
+it had been silently degrading every run in the session, including one
+that "succeeded".
+
+---
+
+## 14. Watch localization against ground truth, not the flight
+
+The single most useful diagnostic added to this project compares
+Cartographer's `map -> base_link` against Gazebo's true model pose and
+alarms past a threshold (`docs`-adjacent helper, run every 45 s):
+
+```
+truth=(-7.93,5.79) slam=(-4.81,5.80) error=3.12m
+```
+
+Two things this catches that watching the simulation cannot. First,
+silent divergence: the vehicle looks fine while the map rots. Second,
+the *shape* of the error, which localises the cause — pure single-axis
+growth means corridor degeneracy (entry 13), whereas a transient spike
+in the direction of travel that recovers when the vehicle settles is
+just pose latency and is harmless.
+
+Expect transients of 1–1.5 m at 0.4 m/s; alarm above that.
+
+---
+
+## 15. Judging the map too soon after arriving
+
+**Symptom.** Every frontier the vehicle reached was immediately
+condemned as "persists after arrival" and blacklisted, one every
+couple of seconds — a machine for discarding good frontiers.
+
+**Cause.** `/map` is published at **1 Hz**, but the check ran on the
+next evaluation ~1 s after arrival, so it usually tested the *same map
+that predated the arrival* — evidence gathered before the vehicle got
+there and saw anything.
+
+**Fix.** Only run the check once a map whose stamp is newer than the
+arrival time is in hand, with a timeout so a stalled map topic cannot
+block exploration.
+
+---
+
+## 16. Everything with `use_sim_time` pays for a 1 kHz clock
+
+**Symptom.** Three trivial Python nodes each sat at ~47% CPU
+regardless of how much data they actually handled — suspiciously
+uniform. Nav2 then logged `Control loop missed its desired rate of
+20.0000Hz` and the vehicle stalled with `Failed to make progress`.
+
+**Cause.** Gazebo publishes `/clock` at **1001 Hz** (`max_step_size`
+0.001, real-time factor 1). Every node with `use_sim_time: true`
+subscribes and runs a callback on all of them; in `rclpy` that
+overhead dwarfs the node's real work.
+
+**Fix.** Turn `use_sim_time` off wherever it isn't needed. `pose_relay`
+forwards transforms with their original stamps and only reads the
+clock to rate-limit; `odom_sanitizer` compares stamps carried by the
+messages. Neither needs it. Nodes that stamp outgoing data (the
+explorer's goals and markers, `twist_stamper`) genuinely do — and note
+the explorer *must* keep it, since it compares map header stamps
+against its own clock (entry 15).
+
+Also worth trimming at the source: Cartographer defaulted to
+`pose_publish_period_sec = 5e-3` (200 Hz) feeding a relay that
+throttles to 50 Hz anyway.
+
+---
+
+## 17. An exploration boundary must sit inside the walls
+
+**Symptom.** The vehicle left the maze entirely, and once outside, in
+open ground with no walls in lidar range, the pose estimate diverged
+by more than 10 m and never recovered.
+
+**Cause.** The maze spans ±10 m and the boundary was set to ±11 m — a
+metre *outside* the outer wall — so goals beyond the maze opening were
+legal. Worse, the boundary is evaluated in the map frame, so once SLAM
+diverges the check is being applied in a frame that no longer
+corresponds to the world: the guard fails exactly when it is needed.
+
+**Fix.** ±9.5 m, comfortably inside the wall. A geofence enforced on a
+drifting estimate is not a real geofence; the only robust version of
+this check would use a source independent of the estimate it protects.
+
+---
+
+## 18. Frontier goals land where the robot is forbidden to be
+
+**Symptom.** The vehicle would fly to within ~0.7 m of its goal, hover
+facing a wall, burn through four Nav2 recoveries and abort the goal.
+
+**Cause.** A frontier borders unknown space, and in a maze unknown
+space usually abuts a wall — so the frontier cell nearest the cluster
+centroid is often within the costmap's *inscribed radius*
+(`robot_radius`, 0.35 m) of one. The planner cannot place the vehicle
+there at all, the path stops short, and the controller grinds toward a
+pose it can never occupy.
+
+Measured across captured maps, this was the common case, not an edge
+case: on one map **all six** goals sat 0.05–0.10 m from a wall, and on
+another six of eleven did.
+
+**Fix.** Rank a cluster's cells by clearance and take the nearest to
+the centroid among those with real room (`min_goal_clearance`, 0.5 m),
+falling back to the roomiest cell in genuinely tight spots. Frontier
+counts are unchanged by this — goals move, clusters are not lost.
+
+**Why an earlier attempt at this failed.** It measured clearance with
+`occupied_min = 65`, so it was computing distance to the *fog* around
+frontiers rather than to walls, and produced incoherent results that
+looked like a broken idea rather than a broken threshold. Same root
+cause as entry 7. A constant reused with the wrong meaning.
+
+---
+
+## 19. Two selection rules, and the worse one won
+
+**Symptom.** Goal choices looked poor despite a carefully measured
+utility function.
+
+**Cause.** An earlier "momentum" heuristic — continue toward whichever
+frontier is nearest the goal just invalidated, by straight-line
+distance — ran *ahead* of the utility ranking and returned early. It
+had been added to stop Euclidean nearest-first zigzagging, a problem
+later solved properly by ranking on travel cost and information gain.
+It was never removed. Since most goals end as "already mapped", the
+crude rule was overriding the measured one on the majority of
+decisions.
+
+**Fix.** Delete it. One selection rule: unknown area revealed per metre
+actually flown.
+
+**Lesson.** A heuristic added to compensate for a weak cost function
+becomes actively harmful once the cost function is fixed. Patches
+deserve removal dates.
+
+---
+
+## 20. Don't demand a heading from a vehicle with a 360-degree sensor
+
+**Symptom.** As entry 18 — arrival never registered, recoveries, abort.
+
+**Cause.** The explorer set each goal's yaw to the bearing from
+wherever the vehicle happened to be at dispatch, and Nav2's goal
+checker required arrival within 0.25 m *and* 0.25 rad of it. By arrival
+that heading is stale and arbitrary. With `acc_lim_y = 0` DWB must yaw
+the copter into it, which is slow, so the vehicle can sit inside the
+position tolerance indefinitely without satisfying the angular one.
+
+**Fix.** `yaw_goal_tolerance: 3.15` — unconstrained. The lidar sees the
+same thing whichever way the vehicle faces, so the heading requirement
+bought nothing and cost a manoeuvre that frequently failed. Position
+tolerance also relaxed to 0.5 m: a frontier is a region to get the
+sensor near, not a pose to hit.
+
+---
+
+## 21. Nav2 recoveries assume a ground robot
+
+Recoveries are what the behaviour tree runs when navigation fails —
+clear the costmaps, spin in place, back up, wait — before retrying and
+eventually aborting. They are worth understanding here because **a
+recovery spin looks exactly like the vehicle being stuck**, and much of
+what appeared to be a controller struggling to turn was in fact Nav2
+having already declared failure.
+
+They also suit the vehicle poorly. A spin is slow on a copter with
+limited yaw rate; a backup moves it blind toward whatever is behind it;
+and the maze frequently lacks room for either — one attempt logged
+`Collision Ahead - Exiting Spin`. Trimming the list to `wait` plus
+costmap clearing is worth considering, so a transient failure costs a
+pause rather than a risky manoeuvre.
 
 ---
 
@@ -263,6 +503,28 @@ make it work: treat an already-set EKF origin as success (ArduPilot
 broadcasts `GPS_GLOBAL_ORIGIN` on the first set only, so re-request it
 explicitly), and skip takeoff when already at altitude, or the second
 takeoff command climbs on top of the current height.
+
+**Change one thing per run.** Runs cost 10–15 minutes. Two parameters
+were once changed together, the run crashed, and neither could be
+attributed — costing another full run purely to isolate. With
+expensive experiments the temptation to batch changes is exactly
+backwards.
+
+**Thresholds picked by intuition are a recurring source of bugs.**
+Three separate failures in this project trace to a number chosen
+because it sounded reasonable: an occupancy of 65 for "wall" (real
+walls are 99-100, and the fog around a frontier has a median of 81, so
+every ray was blocked and every frontier rejected); a boundary of ±11 m
+around a ±10 m maze; and an inflation radius of 0.7 m in corridors
+where a quarter of the space has under 0.6 m of clearance. In every
+case the map data needed to choose correctly was already available.
+Measure the distribution first.
+
+**Capture the map to a file and iterate offline.** Snapshotting `/map`
+to `.npy` and testing the detector against real data turned
+hypothesis-per-flight (10+ minutes) into hypothesis-per-second, and
+every regression test for the subtle detector bugs came from those
+snapshots.
 
 **A method-existence smoke test catches refactor breakage cheaply.**
 An `AttributeError` on a helper renamed during a refactor killed the
