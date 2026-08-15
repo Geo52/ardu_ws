@@ -1,0 +1,6 @@
+# This file allows ignoring commits in git blame view on Github.
+# For more info, see here:
+# https://docs.github.com/en/repositories/working-with-files/using-files/viewing-a-file#ignore-commits-in-the-blame-view
+
+# Fix current pre-commit errors
+98231a3c1ece09e6013b7a1858e8cf43f4365bda

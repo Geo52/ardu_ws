@@ -1,0 +1,27 @@
+---
+name: pre-commit
+
+on:
+  pull_request:
+  push:
+    branches: [humble]
+
+
+concurrency:
+  group: ci-${{github.workflow}}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false  # don't cancel if a job from the matrix fails
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v3
+      - name: Install pre-commit dependencies
+        shell: 'bash'
+        run: |
+          sudo apt update
+          sudo apt install --no-install-recommends libxml2-utils
+      - uses: pre-commit/action@v3.0.0
