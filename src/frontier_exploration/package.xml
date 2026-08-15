@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>frontier_exploration</name>
+  <version>0.1.0</version>
+  <description>
+    Frontier-based autonomous exploration for a GPS-denied UAV.
+    Detects frontiers on the Cartographer occupancy grid, dispatches
+    nearest-first centroid goals to Nav2, feeds Cartographer pose to
+    ArduPilot EKF3 as ExternalNav, and lands when exploration completes.
+  </description>
+  <maintainer email="jorgeluisrios47@gmail.com">Jorge Rios</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>tf2_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>nav2_msgs</exec_depend>
+  <exec_depend>ardupilot_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-pymavlink</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
