@@ -48,7 +48,10 @@ def _dilate4(mask: np.ndarray, iterations: int) -> np.ndarray:
 
 
 def detect_frontier_cells(
-    grid: np.ndarray, free_max: int = 25, unknown_dilation: int = 1
+    grid: np.ndarray,
+    free_max: int = 25,
+    unknown_dilation: int = 1,
+    occupied_min: int = WALL_MIN,
 ) -> np.ndarray:
     """Return a boolean mask of frontier cells.
 
@@ -63,7 +66,25 @@ def detect_frontier_cells(
     """
     free = (grid >= 0) & (grid <= free_max)
     unknown = grid == UNKNOWN
-    return free & _dilate4(unknown, unknown_dilation)
+    # Grow the unknown region through anything that is not a wall.
+    #
+    # The band of partially-observed cells between free space and
+    # unknown is not a fixed width. Where the lidar swept closely it is
+    # a couple of cells; where an area was glimpsed from a distance or
+    # at a grazing angle it runs ten cells or more. A fixed-radius
+    # dilation finds no frontier at all in those places, so a corridor
+    # seen only from afar is never offered as a destination and the
+    # vehicle exhausts the few crisp frontiers it can see while a third
+    # of the maze sits unexplored.
+    #
+    # Masking the growth by walls keeps the reach generous without ever
+    # crossing to the far side of one, which also makes the thin-wall
+    # leak the line-of-sight filter was written for impossible.
+    passable = grid < occupied_min
+    reach = unknown.copy()
+    for _ in range(unknown_dilation):
+        reach = _dilate4(reach, 1) & (passable | unknown)
+    return free & reach
 
 
 def cluster_frontier_cells(
@@ -201,10 +222,14 @@ def find_frontiers(
     require_line_of_sight: bool = False,
     min_goal_clearance: float = 0.0,
     max_goal_candidates: int = 40,
+    face_unknown_radius: int = 0,
 ) -> List[Frontier]:
     """Detect and cluster frontiers on an occupancy grid."""
     mask = detect_frontier_cells(
-        grid, free_max=free_max, unknown_dilation=unknown_dilation
+        grid,
+        free_max=free_max,
+        unknown_dilation=unknown_dilation,
+        occupied_min=occupied_min,
     )
     frontiers = cluster_frontier_cells(mask, min_size=min_size)
     if not frontiers:
@@ -220,9 +245,16 @@ def find_frontiers(
             max_cells=int(min_goal_clearance) + 5,
         )
 
+    facing_unknown = None
+    if face_unknown_radius > 0:
+        facing_unknown = unknown_gain(grid, face_unknown_radius)
+
     selected = []
     for f in frontiers:
-        order = _candidate_order(f.cells, f.centroid, clearance, min_goal_clearance)
+        order = _candidate_order(
+            f.cells, f.centroid, clearance, min_goal_clearance,
+            facing_unknown=facing_unknown,
+        )
         for idx in order[:max_goal_candidates]:
             cell = tuple(int(v) for v in f.cells[idx])
             if not require_line_of_sight or frontier_sees_unknown(
@@ -234,25 +266,46 @@ def find_frontiers(
     return selected
 
 
-def _candidate_order(cells: np.ndarray, centroid, clearance, min_clearance: float):
+def _candidate_order(
+    cells: np.ndarray,
+    centroid,
+    clearance,
+    min_clearance: float,
+    facing_unknown=None,
+):
     """Rank a cluster's cells as goal candidates.
 
-    Frontier cells border unknown space, and unknown space usually
-    abuts a wall, so the cell nearest the centroid is often within the
-    robot's inscribed radius of one. The planner then cannot place the
-    vehicle at the goal: the path stops short and the controller grinds
-    toward a pose it can never occupy, leaving the copter hovering at a
-    wall. Prefer cells with real room around them, nearest-to-centroid
-    among those; fall back to the roomiest available in tight spots.
+    Two things decide the order.
+
+    Clearance first, because frontier cells border unknown space and
+    unknown space usually abuts a wall: the cell nearest the centroid
+    is often inside the robot's inscribed radius, where the planner
+    cannot place the vehicle at all. The path then stops short and the
+    controller grinds toward a pose it can never occupy.
+
+    Among cells with real room, prefer the one facing the most unknown
+    rather than the one nearest the cluster's middle. The goal has to
+    stay on a known-free cell — moving it into the unknown outright
+    plants it inside unmapped wall, which the planner will happily
+    route through — but choosing the free cell with the most unexplored
+    space around it puts the end of the route against the largest patch
+    of unmapped ground instead of the middle of the boundary.
     """
     dists = np.linalg.norm(cells - np.asarray(centroid), axis=1)
+    if facing_unknown is not None:
+        facing = facing_unknown[cells[:, 0], cells[:, 1]]
+        # Negative so that argsort puts the most unknown-facing first.
+        primary = -facing.astype(float)
+    else:
+        primary = dists
+
     if clearance is None or min_clearance <= 0:
-        return np.argsort(dists)
+        return np.argsort(primary)
     room = clearance[cells[:, 0], cells[:, 1]]
     roomy = np.flatnonzero(room >= min_clearance)
     tight = np.flatnonzero(room < min_clearance)
     return np.concatenate(
-        [roomy[np.argsort(dists[roomy])], tight[np.argsort(-room[tight])]]
+        [roomy[np.argsort(primary[roomy])], tight[np.argsort(-room[tight])]]
     )
 
 

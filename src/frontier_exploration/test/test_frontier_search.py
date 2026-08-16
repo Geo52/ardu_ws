@@ -108,20 +108,20 @@ def test_dilation_does_not_leak_through_thick_walls():
     assert not mask.any()
 
 
-def test_line_of_sight_rejects_frontiers_behind_thin_walls():
+def test_thin_wall_blocks_frontiers_either_way():
     from frontier_exploration.frontier_search import find_frontiers
 
-    # free | 2-cell wall | unknown: dilation 3 leaks through the thin
-    # wall, but the LOS filter must reject the resulting frontier.
+    # free | 2-cell wall | unknown. Dilation is masked by walls, so the
+    # unknown cannot reach across even a thin one and no frontier is
+    # produced. This used to leak and depend on the line-of-sight
+    # filter to clean up afterwards; both paths must now stay clean.
     grid = make_grid(12, 14, fill=-1)
     grid[:, :5] = 0
     grid[:, 5:7] = 100
-    leaked = find_frontiers(grid, min_size=3, unknown_dilation=3)
-    assert leaked  # sanity: the artifact exists without the filter
-    filtered = find_frontiers(
-        grid, min_size=3, unknown_dilation=3, require_line_of_sight=True
-    )
-    assert filtered == []
+    assert find_frontiers(grid, min_size=3, unknown_dilation=8) == []
+    assert find_frontiers(
+        grid, min_size=3, unknown_dilation=8, require_line_of_sight=True
+    ) == []
 
 
 def test_line_of_sight_keeps_open_frontiers():

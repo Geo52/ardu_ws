@@ -75,10 +75,14 @@ class Explorer(Node):
         self.declare_parameter("takeoff_alt", 2.0)
         self.declare_parameter("free_max", 25)
         self.declare_parameter("min_frontier_size", 10)
-        # Cartographer grids have a ~2-cell intermediate-probability rim
-        # between free and unknown space; see frontier_search. Must stay
-        # below the thinnest wall thickness in cells (4 in the maze).
-        self.declare_parameter("unknown_dilation", 3)
+        # How far the unknown region is grown toward free space when
+        # looking for frontiers. Masked by walls (see frontier_search),
+        # so it can be generous without leaking through them — and it
+        # must be, because the fog band between mapped and unmapped
+        # space is far wider than a few cells wherever an area was only
+        # glimpsed from a distance. At 3 the detector offered just 4
+        # frontiers while 75 m2 of the maze remained unexplored.
+        self.declare_parameter("unknown_dilation", 8)
         # Exploration boundary (map frame). The maze world spans +/-10 m
         # and has an opening in its outer wall, so these must sit
         # INSIDE that wall: at +/-11 the vehicle was allowed to chase
@@ -96,13 +100,33 @@ class Explorer(Node):
         # frontier's information gain. Roughly the useful sensing
         # footprint in a maze, where walls curtail the 30 m lidar.
         self.declare_parameter("gain_radius", 6.0)
+        # Two frontier observations closer than this are treated as the
+        # same frontier across evaluation cycles, so it keeps its
+        # discovery order as its centroid drifts.
+        self.declare_parameter("frontier_match_radius", 2.0)
+        # A frontier within this distance (m) of anywhere the vehicle
+        # has already flown counts as somewhere it has been, and is
+        # ranked behind every frontier in new ground.
+        self.declare_parameter("visited_radius", 2.5)
+        self.declare_parameter("visited_spacing", 0.5)
         # Keep goals this far (m) from walls. Below the costmap's
         # inscribed radius (robot_radius, 0.35) the planner cannot put
         # the vehicle at the goal at all.
         self.declare_parameter("min_goal_clearance", 0.5)
+        # Among a cluster's cells, prefer the one with the most unknown
+        # within this radius (m), so the route ends against the largest
+        # patch of unexplored ground rather than the middle of the
+        # frontier. The goal stays on a known-free cell: moving it into
+        # the unknown outright plants it inside unmapped wall.
+        self.declare_parameter("face_unknown_radius", 2.5)
         # How long to wait for a post-arrival map before giving up on
         # the persistence check rather than blocking exploration.
         self.declare_parameter("arrival_settle_timeout", 8.0)
+        # A frontier counts as unmappable-from-here only after surviving
+        # this many arrivals within persist_same_spot metres of each
+        # other; one survival just means it receded as we mapped.
+        self.declare_parameter("persist_before_blacklist", 3)
+        self.declare_parameter("persist_same_spot", 1.5)
         self.declare_parameter("blacklist_radius", 0.8)
         self.declare_parameter("goal_timeout", 90.0)
         # A goal is preempted when no frontier cell remains within this
@@ -126,7 +150,15 @@ class Explorer(Node):
         self._unknown_dilation = self.get_parameter("unknown_dilation").value
         self._marker_cell_budget = self.get_parameter("marker_cell_budget").value
         self._gain_radius = self.get_parameter("gain_radius").value
+        self._frontier_match_radius = self.get_parameter(
+            "frontier_match_radius"
+        ).value
+        self._visited_radius = self.get_parameter("visited_radius").value
+        self._visited_spacing = self.get_parameter("visited_spacing").value
         self._min_goal_clearance = self.get_parameter("min_goal_clearance").value
+        self._face_unknown_radius = self.get_parameter(
+            "face_unknown_radius"
+        ).value
         self._bounds = (
             self.get_parameter("bound_min_x").value,
             self.get_parameter("bound_max_x").value,
@@ -142,6 +174,10 @@ class Explorer(Node):
         self._arrival_settle_timeout = self.get_parameter(
             "arrival_settle_timeout"
         ).value
+        self._persist_before_blacklist = self.get_parameter(
+            "persist_before_blacklist"
+        ).value
+        self._persist_same_spot = self.get_parameter("persist_same_spot").value
 
         # Interfaces to ArduPilot (AP_DDS exposes them under /ap/v1).
         self.declare_parameter("ap_ns", "/ap/v1")
@@ -182,6 +218,13 @@ class Explorer(Node):
         self._goal_seq = 0
         self._reached_goal_xy = None
         self._reached_at = None
+        self._last_persist_xy = None
+        self._persist_count = 0
+        self._climb_ticks = 0
+        self._climb_timeout_ticks = 25
+        self._visited = []           # sampled flight path
+        self._known_frontiers = []   # (x, y, discovery sequence)
+        self._frontier_seq = 0
         self._goals_succeeded = 0
         self._goals_failed = 0
         self._empty_evals = 0
@@ -421,10 +464,25 @@ class Explorer(Node):
             return
 
         if self._state == State.CLIMB:
+            self._climb_ticks += 1
             if self._ap_alt is not None and self._ap_alt >= 0.9 * self._takeoff_alt:
                 self.get_logger().info(
                     f"Reached {self._ap_alt:.2f} m, starting exploration"
                 )
+                self._climb_ticks = 0
+                self._state = State.EXPLORE
+            elif self._climb_ticks >= self._climb_timeout_ticks:
+                # Never block the mission on an exact altitude. A
+                # takeoff issued to an already-airborne copter does not
+                # climb like a fresh one, so after an altitude-sag
+                # recovery the vehicle settled at 1.4 m and this state
+                # waited forever. Any height that clears the ground is
+                # enough to map from; the walls are 3.25 m.
+                self.get_logger().warning(
+                    f"Still at {self._ap_alt:.2f} m after {self._climb_ticks}s; "
+                    "exploring anyway"
+                )
+                self._climb_ticks = 0
                 self._state = State.EXPLORE
             return
 
@@ -494,6 +552,9 @@ class Explorer(Node):
             unknown_dilation=self._unknown_dilation,
             require_line_of_sight=True,
             min_goal_clearance=self._min_goal_clearance / info.resolution,
+            face_unknown_radius=int(
+                self._face_unknown_radius / info.resolution
+            ),
         )
 
         # World-frame goal for each cluster, minus blacklisted ones and
@@ -527,10 +588,44 @@ class Explorer(Node):
             if map_time > self._reached_at:
                 rx, ry = self._reached_goal_xy
                 if self._frontier_near(frontiers, info, rx, ry):
-                    self.get_logger().info(
-                        "Frontier persists after arrival, blacklisting"
-                    )
-                    self._blacklist.append(self._reached_goal_xy)
+                    # Surviving one arrival is normal, and is how a
+                    # corridor gets explored: arrive, map the near part,
+                    # the frontier recedes deeper, go again. Blacklisting
+                    # on the first survival takes one bite of a corridor
+                    # and abandons it — especially since "arrived" means
+                    # within xy_goal_tolerance, which need not be close
+                    # enough to clear it.
+                    #
+                    # Only a frontier that survives repeated arrivals at
+                    # the same place is genuinely unmappable from there.
+                    # A goal that has moved on means progress, so the
+                    # count restarts.
+                    if (
+                        self._last_persist_xy is not None
+                        and math.hypot(
+                            rx - self._last_persist_xy[0],
+                            ry - self._last_persist_xy[1],
+                        )
+                        < self._persist_same_spot
+                    ):
+                        self._persist_count += 1
+                    else:
+                        self._persist_count = 1
+                    self._last_persist_xy = (rx, ry)
+
+                    if self._persist_count >= self._persist_before_blacklist:
+                        self.get_logger().info(
+                            f"Frontier unchanged after {self._persist_count} "
+                            "arrivals, blacklisting"
+                        )
+                        self._blacklist.append(self._reached_goal_xy)
+                        self._persist_count = 0
+                        self._last_persist_xy = None
+                    else:
+                        self.get_logger().info(
+                            "Frontier receded rather than cleared; "
+                            "continuing into it"
+                        )
                 self._reached_goal_xy = None
             elif waited > Duration(seconds=self._arrival_settle_timeout):
                 self.get_logger().warning("No fresh map after arrival; skipping check")
@@ -551,6 +646,8 @@ class Explorer(Node):
         # ground it has already covered. Unreachable candidates are
         # dropped here rather than discovered by flying at them.
         pose = self._robot_xy()
+        if pose is not None:
+            self._record_visited(*pose)
         if pose is not None and candidates:
             rx, ry = pose
             robot_cell = (
@@ -567,34 +664,53 @@ class Explorer(Node):
             # Measured on a real map: cost-only picks a frontier 18 m
             # away revealing 15 m2, this picks one 32 m away revealing
             # 56 m2.
-            gain = unknown_gain(
-                grid, int(self._gain_radius / info.resolution)
-            )
-            cell_area = info.resolution ** 2
-            # The travel estimate is a coarse approximation, so it ranks
-            # but never vetoes: Nav2 plans at full resolution and finds
-            # routes this misses. Discarding "unreachable" candidates
-            # instead threw away 3 of 4 real frontiers and landed the
-            # vehicle on a map only 90 m2 explored. Unreachable ones go
-            # last, and are still tried once everything else is done.
-            ranked = []
+            # Depth-first: go to the most recently discovered frontier.
+            #
+            # Frontiers are recomputed from scratch each cycle, so a
+            # policy that only looks at the current set has no memory of
+            # which opening it uncovered last. Two corridors of similar
+            # distance then trade the lead every time one is partly
+            # mapped, and neither gets finished.
+            #
+            # Tracking when each frontier was first seen gives the stack
+            # discipline DFS needs. New frontiers appear where the
+            # vehicle is currently revealing space, so preferring the
+            # newest drives it deeper down one branch; when that branch
+            # is exhausted the newest surviving frontier is whatever was
+            # deferred most recently, which is the backtrack. Distance
+            # only breaks ties among equally-recent frontiers.
             unreachable = 0
+            tagged = []
             for x, y, f in candidates:
                 cost = travel[f.goal_cell] * info.resolution
-                reveals = gain[f.goal_cell] * cell_area
-                if math.isfinite(cost):
-                    score = reveals / (cost + 2.0)
-                else:
+                if not math.isfinite(cost):
                     unreachable += 1
-                    score = -1.0  # sorts below every reachable candidate
-                ranked.append((score, x, y, f))
+                    cost = 1e6  # tried last, never vetoed
+                tagged.append(
+                    (self._been_there(x, y), self._frontier_age(x, y),
+                     cost, x, y, f)
+                )
             if unreachable:
                 self.get_logger().info(
                     f"{unreachable} frontier(s) with no coarse route, "
                     "deprioritised"
                 )
-            ranked.sort(key=lambda r: -r[0])
-            candidates = [(x, y, f) for _, x, y, f in ranked]
+            self._forget_stale_frontiers(candidates)
+            # Somewhere new first; then newest-discovered (depth-first);
+            # then nearest. A frontier inside ground the vehicle has
+            # already flown is real — residual fog is left along the
+            # path itself, behind the vehicle and at grazing angles —
+            # but going back for it while anywhere new remains is what
+            # makes the exploration look like it is retracing itself.
+            # Ranked last rather than discarded, so they are still
+            # collected once the unvisited frontiers are gone.
+            tagged.sort(key=lambda t: (t[0], -t[1], t[2]))
+            candidates = [(x, y, f) for _, _, _, x, y, f in tagged]
+            fresh = sum(1 for t in tagged if t[0] == 0)
+            if fresh == 0 and tagged:
+                self.get_logger().info(
+                    "Only already-visited frontiers remain; going back for them"
+                )
 
         if not candidates:
             self._empty_evals += 1
@@ -635,6 +751,63 @@ class Explorer(Node):
         # measured one.
         x, y, f = candidates[0]
         self._send_goal(x, y, rx, ry)
+
+
+    # ------------------------------------------------------------------
+    # Frontier discovery order (depth-first bookkeeping)
+    # ------------------------------------------------------------------
+    def _frontier_age(self, x, y):
+        """Sequence number of when this frontier was first seen.
+
+        Frontier clusters are recomputed every cycle and their centroids
+        shift as the map fills in, so identity is by proximity: a
+        frontier within `frontier_match_radius` of a known one is the
+        same frontier, and keeps its original sequence number. Anything
+        else is newly discovered and gets the next number.
+        """
+        for i, (px, py, seq) in enumerate(self._known_frontiers):
+            if math.hypot(x - px, y - py) < self._frontier_match_radius:
+                # Track its latest position so it can drift with the map.
+                self._known_frontiers[i] = (x, y, seq)
+                return seq
+        self._frontier_seq += 1
+        self._known_frontiers.append((x, y, self._frontier_seq))
+        return self._frontier_seq
+
+    def _forget_stale_frontiers(self, candidates):
+        """Drop remembered frontiers that no longer exist.
+
+        Without this the list grows without bound and, worse, a mapped
+        away frontier could keep its old sequence number if a new one
+        later appeared nearby.
+        """
+        if not candidates:
+            self._known_frontiers = []
+            return
+        live = []
+        for px, py, seq in self._known_frontiers:
+            if any(
+                math.hypot(px - x, py - y) < self._frontier_match_radius
+                for x, y, _ in candidates
+            ):
+                live.append((px, py, seq))
+        self._known_frontiers = live
+
+
+    def _record_visited(self, x, y):
+        """Remember roughly where the vehicle has flown."""
+        if self._visited and math.hypot(
+            x - self._visited[-1][0], y - self._visited[-1][1]
+        ) < self._visited_spacing:
+            return
+        self._visited.append((x, y))
+
+    def _been_there(self, x, y):
+        """1 if this goal sits in ground the vehicle has already flown."""
+        for vx, vy in self._visited:
+            if math.hypot(x - vx, y - vy) < self._visited_radius:
+                return 1
+        return 0
 
     def _robot_xy(self):
         try:

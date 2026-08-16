@@ -173,12 +173,22 @@ def generate_launch_description():
 
     # The stock twist_stamper (ardupilot_cartographer) publishes velocity
     # commands on /ap/cmd_vel, but AP_DDS subscribes under /ap/v1.
+    # Forwards /ap/cmd_vel into the /ap/v1 namespace this ArduPilot
+    # build uses, and fills in the vertical velocity Nav2 never sets.
+    # Nav2 is 2D: it leaves linear.z at 0 and nothing else controls
+    # height, so the vehicle sagged out of the air repeatedly.
     cmd_vel_relay = Node(
-        package="topic_tools",
-        executable="relay",
-        arguments=["/ap/cmd_vel", "/ap/v1/cmd_vel"],
+        package="frontier_exploration",
+        executable="cmd_vel_altitude_hold",
         output="screen",
-        parameters=[{"use_sim_time": True}],
+        parameters=[
+            {
+                "use_sim_time": False,
+                "target_alt": ParameterValue(
+                    LaunchConfiguration("takeoff_alt"), value_type=float
+                ),
+            }
+        ],
     )
 
     explorer = TimerAction(

@@ -28,6 +28,7 @@ setup(
             "explorer = frontier_exploration.explorer_node:main",
             "pose_relay = frontier_exploration.pose_relay:main",
             "odom_sanitizer = frontier_exploration.odom_sanitizer:main",
+            "cmd_vel_altitude_hold = frontier_exploration.altitude_hold_relay:main",
         ],
     },
 )
