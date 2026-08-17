@@ -207,10 +207,11 @@ A full run takes roughly 10–15 minutes of wall time.
 Launch arguments: `gui:=false` (no Gazebo GUI), `rviz:=false`,
 `takeoff_alt:=2.5`.
 
-To watch the algorithm rather than just the vehicle, add the
-`/frontier_explorer/frontiers` MarkerArray display in RViz: frontier
-cells in cyan, candidate goals as orange spheres, active goal as a green
-cylinder.
+RViz comes up on this package's own config, so the algorithm's view is
+already there: frontier cells in cyan, candidate goals as orange
+spheres, the active goal as a green cylinder, on
+`/frontier_explorer/frontiers`. Watching what the policy is *considering*
+rather than only where the vehicle went is most of the debugging.
 
 ## Key parameters
 

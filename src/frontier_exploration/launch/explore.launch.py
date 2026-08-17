@@ -29,7 +29,6 @@ from launch_ros.parameter_descriptions import ParameterValue
 def generate_launch_description():
     pkg_sitl = get_package_share_directory("ardupilot_sitl")
     pkg_gz_bringup = get_package_share_directory("ardupilot_gz_bringup")
-    pkg_cartographer = get_package_share_directory("ardupilot_cartographer")
     pkg_self = get_package_share_directory("frontier_exploration")
 
     sitl_params = os.path.join(pkg_sitl, "config", "default_params")
@@ -149,12 +148,26 @@ def generate_launch_description():
                     ("cmd_vel_out", "ap/cmd_vel"),
                 ],
             ),
+            # This package's own RViz config, not ardupilot_cartographer's:
+            # the stock one knows nothing about frontier markers, so the
+            # display had to be added by hand on every launch. This is the
+            # same config plus a MarkerArray on
+            # /frontier_explorer/frontiers -- cyan frontier cells, orange
+            # candidate goals, a green cylinder on the active goal. Seeing
+            # what the policy is considering, rather than only where the
+            # vehicle went, is most of the debugging.
+            #
+            # use_sim_time matters here and the stock invocation omitted
+            # it. Gazebo's clock starts at zero while the system clock is
+            # at the epoch, so an RViz on system time finds every
+            # transform hopelessly stale and draws nothing.
             Node(
                 package="rviz2",
                 executable="rviz2",
+                parameters=[{"use_sim_time": True}],
                 arguments=[
                     "-d",
-                    os.path.join(pkg_cartographer, "rviz", "navigation.rviz"),
+                    os.path.join(pkg_self, "rviz", "frontiers.rviz"),
                 ],
                 condition=IfCondition(LaunchConfiguration("rviz")),
             ),
