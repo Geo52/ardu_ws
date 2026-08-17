@@ -134,7 +134,28 @@ global_costmap:
       use_sim_time: *default_use_sim_time
       robot_radius: 0.35
       resolution: 0.05
-      lethal_cost_threshold: 50
+      # Occupancy at or above which a map cell becomes a lethal obstacle.
+      #
+      # This was 50, which is below Cartographer's fog. Measured on run
+      # 71's final map: real walls occupy 90-100 (3839 cells), while
+      # 26-89 is the partially-observed band Cartographer leaves around
+      # everything it has not resolved (10068 cells). At 50 two thirds
+      # of what the costmap called wall was fog, and inflation_radius
+      # 1.0 painted a 1 m halo around every one of them -- 47945 cells
+      # at inscribed cost 99, against 11401 genuinely lethal.
+      #
+      # The effect is a planner that refuses freshly explored ground:
+      # run 71 logged 28 x "failed to create plan" and aborted 13 of 49
+      # goals, each one sitting at cost 99 in the costmap while reading
+      # free in the map, and landed with a third of the south-east
+      # quadrant visible but unplannable. Replaying that map, the goals
+      # Nav2 refused go from 0/4 reachable at 50 to 4/4 at 90, and the
+      # plannable area from 244.0 m2 to 268.6 m2.
+      #
+      # Note the failure gets worse the better exploration works: fog is
+      # what a map is made of before it settles, so pushing hard into
+      # new ground is exactly what fills the costmap with false walls.
+      lethal_cost_threshold: 90
       always_send_full_costmap: True
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
       static_layer:
