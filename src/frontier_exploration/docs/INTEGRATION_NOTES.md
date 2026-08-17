@@ -522,6 +522,133 @@ usually what is broken.
 
 ---
 
+## 23. A dilation wider than a wall invents frontiers on the far side
+
+**Symptom.** Run 70 landed having mapped 275.2 m² and left 25.1 m² of
+the south-east corridor — 91% of it — untouched, after dispatching
+twelve goals to `(7.76, -3.75)` and neighbouring points. Each reported
+`Frontier reached` within seconds and then `Frontier receded rather
+than cleared`, forever.
+
+**Cause.** That goal sits *south* of the wall at y = -3.5, in corridor
+the vehicle had already mapped. It was attacking the unexplored
+corridor through a wall. `unknown_dilation` had been raised to 6 while
+the maze's walls are 0.2 m — 4 cells at 0.05 m/cell — so the dilation
+reaches clean through them and marks free cells on this side as
+bordering the unknown on the far side. Entry 8 is the same failure;
+raising the reach from 3 to 6 to see across wide fog banks reopened it.
+
+The corridor's real opening, at its west end near `(-1.4, -1.5)`, was
+detected the whole time as a 21-cell cluster — 93× smaller than the
+false one, so it never won a ranking.
+
+**Fix.** Back to `unknown_dilation = 3`. Replaying run 70's final map:
+
+| Dilation | Clusters | Pointing into the ground actually missed |
+|---|---|---|
+| 2 | 3 | 3 (under-detects overall) |
+| 3 | 12 | 4 |
+| 4 | 8 | 2 |
+| 6 | 12 | 1 |
+
+**Caveat.** This narrows the false attractor rather than removing it:
+goals hard against a wall face still appear at 3. The line-of-sight
+filter is what is supposed to catch them, and it lets them through
+wherever the mapped wall has an unobserved gap for a ray to slip.
+
+**Generalisation worth keeping.** Any reach across unknown space needs
+a bound tied to the thinnest barrier in the environment, not to how
+much fog you want to see across. The two requirements conflict, and
+the wall wins — a frontier you cannot reach is worse than one you
+cannot see, because you will fly at it repeatedly.
+
+---
+
+## 24. The costmap reads Cartographer's fog as wall
+
+**Symptom.** Run 71 stranded. Every goal aborted with `status 6` about
+21 s after dispatch, from a vehicle hovering in open space with 1.0 m
+of clearance, while `Failed to make progress` never appeared once. It
+landed at 328.5 m² with the whole south-east quadrant visible on the
+map and unreachable.
+
+**Cause.** `Failed to create a plan` × 28: the *global planner* was
+refusing, so the controller never received a path — which is why the
+controller-side warning is absent and why the vehicle simply sat
+there. Comparing `/global_costmap/costmap` against `/map` at the same
+instant, goals reading free in the map (0 and 20) carried cost 99,
+inscribed, in the costmap.
+
+`navigation.yaml` had `lethal_cost_threshold: 50`. Measured on run
+71's final map:
+
+| Occupancy | Cells | What it is |
+|---|---|---|
+| 0-25 | 131367 | free |
+| 26-49 | 2506 | light fog |
+| 50-89 | 7562 | **fog, treated as lethal wall** |
+| 90-100 | 3839 | real wall |
+
+Two thirds of what the costmap called wall was fog, and with
+`inflation_radius: 1.0` each of those 7562 cells painted a metre-wide
+halo — 47945 cells at inscribed cost against 11401 genuinely lethal.
+
+**Fix.** `lethal_cost_threshold: 90`. Simulating NavFn's constraint
+against that same map — dilate everything called lethal by the 0.35 m
+inscribed radius, then flood-fill from where the vehicle was stranded:
+
+| Threshold | Plannable area | Refused goals now reachable |
+|---|---|---|
+| 50 | 244.0 m² | 0/4 |
+| 65 | 253.0 m² | 2/4 |
+| 80 | 258.5 m² | 4/4 |
+| 90 | 268.6 m² | 4/4 |
+
+Run 72 then mapped 368.8 m² of a ~390 m² navigable maze with **zero**
+Nav2 aborts, against 16 in run 70 and 13 in run 71.
+
+**Why it hid for so long.** The failure scales with how well
+exploration works. Fog is what a map is made of before it settles, so
+the harder the vehicle pushes into new ground the more of the costmap
+becomes false wall. Run 70 never triggered it because it never got
+anywhere new; fixing entry 23 is what exposed it.
+
+**Same root as entry 18.** A constant reused with the wrong meaning.
+There it was `occupied_min = 65` measuring distance to fog instead of
+to walls; here it is Nav2's lethal threshold set below the fog band.
+Both were picked as "about half of 100".
+
+---
+
+## 25. ...and the over-correction routes through walls
+
+**Symptom.** Watching run 72 in RViz: planned paths crossing walls.
+
+**Cause.** Entry 24's fix, overshot. At `lethal_cost_threshold: 90`
+everything reading 50-89 is passable, and a wall seen only at distance
+or at a grazing angle has not yet reached 90. The planner cannot see
+walls it has only partially observed.
+
+**Fix, not yet applied.** 80. The replay table in entry 24 shows it
+unlocking the same 4/4 refused goals as 90 while keeping the 80-89
+band as obstacle. The 10 extra points bought no access and gave away a
+third of the evidence for a wall's existence.
+
+**Status.** Run 72 flew clean — no crash detector, no collision, no
+EKF failsafe — but that is one run, and the trade is real: the more
+permissive the threshold, the more the planner will confidently route
+through geometry it has merely glimpsed. Occupancy is evidence, and
+this parameter sets how much evidence a wall needs before it is
+allowed to stop you.
+
+**The shape of the pair.** Entries 24 and 25 are one decision seen
+from both sides — believe fog and you cannot move, disbelieve it and
+you fly into things. Anything between 80 and 89 buys access at the
+price of wall fidelity, and the right value is the one where the fog
+band ends, measured on a real map, not a round number.
+
+---
+
 ## Operational lessons
 
 **Orphaned processes are the sneakiest failure mode.** `ros2 launch`
@@ -576,3 +703,21 @@ An `AttributeError` on a helper renamed during a refactor killed the
 explorer *in flight*, several minutes into a run. Unit tests did not
 cover the ROS node. A three-line assertion that the expected methods
 exist runs in the same second as the build.
+
+**Simulate the planner's constraint before flying the fix.** The
+offline-replay habit above applies past the detector. Entry 24's fix
+was chosen by reimplementing NavFn's rule against a captured map —
+dilate every cell the costmap calls lethal by the inscribed radius,
+flood-fill from the vehicle, ask which goals survive — and the model
+reproduced the observed failure exactly (0/4 goals reachable at the
+shipped threshold, matching a 100% abort rate). Agreement on the
+*broken* configuration is what makes the predicted fix trustworthy;
+without it the sweep is just four numbers. It also priced the
+alternatives in the same pass, which is where the evidence that 80
+suffices came from.
+
+**Distrust a coverage figure that has no ground-truth check beside
+it.** Run 72's 368.8 m² would look like the run 35 divergence (332.9
+m², a fabrication) without the drift check running alongside it. Two
+numbers, always together: what you mapped, and how far the estimate
+was from truth when you mapped it.
