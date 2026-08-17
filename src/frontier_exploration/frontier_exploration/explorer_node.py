@@ -16,6 +16,7 @@ Flight sequence (all via the ArduPilot DDS interface):
 
 import math
 import threading
+from dataclasses import replace
 from enum import Enum, auto
 
 import numpy as np
@@ -42,6 +43,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 from frontier_exploration.frontier_search import (
     cell_to_world,
     find_frontiers,
+    rank_candidates,
     travel_distances,
     unknown_gain,
 )
@@ -82,18 +84,75 @@ class Explorer(Node):
         # space is far wider than a few cells wherever an area was only
         # glimpsed from a distance. At 3 the detector offered just 4
         # frontiers while 75 m2 of the maze remained unexplored.
-        self.declare_parameter("unknown_dilation", 8)
-        # Exploration boundary (map frame). The maze world spans +/-10 m
-        # and has an opening in its outer wall, so these must sit
-        # INSIDE that wall: at +/-11 the vehicle was allowed to chase
-        # goals a metre outside the maze, flew out through the opening,
-        # and once in open ground the lidar had no walls to scan-match
-        # against. Cartographer then diverged by >10 m, which silently
-        # invalidates the map, the EKF pose and this bounds check itself.
-        self.declare_parameter("bound_min_x", -9.5)
-        self.declare_parameter("bound_max_x", 9.5)
-        self.declare_parameter("bound_min_y", -9.5)
-        self.declare_parameter("bound_max_y", 9.5)
+        # Measured on a stalled map: reach 3 found 3 frontiers (whole
+        # corridors invisible), reach 8 found 7 but four of them were
+        # false — fog along a wall face is ambiguous between open
+        # passage and unconfirmed wall, and too long a reach pushes
+        # through solid geometry to manufacture frontiers that can
+        # never be cleared. Reach 6 gave 7 genuine and only 2 false.
+        #
+        # Lowered back to 3 after run 70. That run landed with 25.1 m2
+        # of the south-east corridor (91% of it) unmapped, having spent
+        # 12+ goals attacking it from the wrong side: at reach 6 the
+        # dilation crosses the 0.2 m wall at y = -3.5 (4 cells at 0.05
+        # m/cell) and manufactures a large frontier at (7.76, -3.75)
+        # that sits in already-mapped corridor, while the corridor's
+        # real opening at its west end registers as only 21 cells and
+        # never outranks it. Replaying run 70's final map:
+        #
+        #   dilation  clusters  pointing into the unmapped regions
+        #          2         3      3   (under-detects overall)
+        #          3        12      4
+        #          4         8      2
+        #          6        12      1
+        #
+        # Reach 3 offers the most distinct ways into the ground that
+        # was actually missed. Note the leak is not unique to 6 -- goals
+        # hard against a wall face appear at 3 as well -- so this
+        # narrows the false attractor rather than eliminating it.
+        self.declare_parameter("unknown_dilation", 3)
+        # Exploration boundary (map frame), set just outside the maze's
+        # outer wall.
+        #
+        # This check exists to catch a diverged pose, not to keep the
+        # vehicle in the maze -- worlds/maze_closed.sdf seals the 3 m
+        # gap it used to escape through, so geometry handles that now.
+        # It was originally +/-11, a metre outside the wall, which let
+        # the vehicle chase goals into open ground where a 2D lidar has
+        # nothing to scan-match against; Cartographer diverged by >10 m
+        # and silently invalidated the map, the EKF pose and this check
+        # itself.
+        #
+        # Tightening it to +/-9.5 overcorrected. Measured against the
+        # walls on run 67 (x [-10.05, 9.85], y [-7.02, 9.98]) a +/-9.5
+        # box discards 14.0 m2 of already-mapped free space as goal
+        # candidates, including the whole strip the west corridor's
+        # 1021-cell frontier sits in at x = -9.80 -- the largest
+        # frontier on the map, silently dropped every cycle, which is
+        # why three consecutive runs left that corridor unexplored.
+        #
+        # The maze is also not square: it runs to y = -7, not -9.5, so
+        # a symmetric box was never the right shape. These follow the
+        # wall extent with a small margin, which still traps any pose
+        # that has genuinely diverged.
+        #
+        # Take the extent from the world file, never from a map. The
+        # maze's outer wall sits at +/-10 in both axes (39 poses in
+        # worlds/maze_closed.sdf, x and y both spanning -10..10), so
+        # +/-9.9 is just inside it.
+        #
+        # Measuring it from a map instead produced two wrong answers in
+        # a row. Run 67's occupancy grid had no wall below y = -7.02,
+        # so a bound of -7.0 looked correct -- but the grid stopped
+        # there only because no run had ever entered the region below,
+        # and that bound would have sealed off the entire southern
+        # third of the maze permanently. A map cannot tell you how big
+        # the world is when the unexplored part is what you are
+        # measuring.
+        self.declare_parameter("bound_min_x", -9.9)
+        self.declare_parameter("bound_max_x", 9.9)
+        self.declare_parameter("bound_min_y", -9.9)
+        self.declare_parameter("bound_max_y", 9.9)
         self.declare_parameter("eval_period", 2.0)
         self.declare_parameter("marker_cell_budget", 800)
         # Radius (m) over which unknown area is counted when scoring a
@@ -119,6 +178,16 @@ class Explorer(Node):
         # frontier. The goal stays on a known-free cell: moving it into
         # the unknown outright plants it inside unmapped wall.
         self.declare_parameter("face_unknown_radius", 2.5)
+        # A frontier revealing less unknown than this (m2, counted
+        # within face_unknown_radius of the goal) is demoted behind
+        # everything that reveals more -- never dropped, so it is still
+        # collected at the end.
+        #
+        # Chosen from the data, not by feel. Across two captured maps
+        # the frontiers worth flying to revealed 5.5-15.8 m2 while fog
+        # banded along the outer wall revealed 0.5-2.1 m2, with nothing
+        # in between; 3.0 sits in that gap on both.
+        self.declare_parameter("min_unknown_gain_m2", 3.0)
         # How long to wait for a post-arrival map before giving up on
         # the persistence check rather than blocking exploration.
         self.declare_parameter("arrival_settle_timeout", 8.0)
@@ -127,8 +196,49 @@ class Explorer(Node):
         # other; one survival just means it receded as we mapped.
         self.declare_parameter("persist_before_blacklist", 3)
         self.declare_parameter("persist_same_spot", 1.5)
-        self.declare_parameter("blacklist_radius", 0.8)
+        # Radius around a blacklisted point that is also excluded.
+        # Frontiers arrive in lines, not singly: an unconfirmed fog
+        # band along a wall face produces a dozen near-identical
+        # frontiers a metre apart, none of which can ever be cleared
+        # because the barrier behind them is solid. At 0.8 m each had
+        # to be visited three times to dismiss it, which is upwards of
+        # thirty wasted trips. Dismissing a neighbourhood at a time
+        # costs a little genuine frontier at the edges and saves the
+        # endgame from grinding.
+        self.declare_parameter("blacklist_radius", 2.5)
+        # ...but that radius is calibrated for fog bands, and applying it
+        # to a large frontier seals the way into whatever it opens onto.
+        #
+        # Run 70 landed with 14.4 m2 of the west strip unmapped while the
+        # detector was still offering it as a 1949-cell frontier -- the
+        # largest on the map by a factor of three. One Nav2 abort at
+        # (-9.59, -4.80) blacklisted a 2.5 m neighbourhood, which is the
+        # entire entrance; three separate attempts over the run each died
+        # the same way, and the two blacklist-clear retries were spent
+        # elsewhere. Nothing was wrong with the frontier: `Failed to make
+        # progress` never appears in that run, so the controller was not
+        # stalling, the planner simply refused that one goal cell.
+        #
+        # A cluster that large has hundreds of alternative goal cells, so
+        # excluding just the cell that failed lets the next evaluation
+        # approach the same region from somewhere the planner accepts,
+        # while small frontiers keep the wide radius that stops the
+        # endgame grinding through a dozen near-identical fog goals.
+        self.declare_parameter("large_frontier_cells", 400)
+        self.declare_parameter("large_frontier_blacklist_radius", 0.6)
+        # Bound on that leniency. Each failed goal costs ~20 s, and a
+        # 1949-cell cluster holds enough alternative cells to spend ten
+        # minutes discovering the planner refuses all of them. After
+        # this many narrow exclusions in one neighbourhood, treat the
+        # region as genuinely unreachable and apply the full radius.
+        self.declare_parameter("large_frontier_attempts", 3)
         self.declare_parameter("goal_timeout", 90.0)
+        # How far from an abandoned goal a frontier still counts as
+        # "onward" when the goal was dropped because its area got
+        # mapped from a distance. Wide enough to cover a frontier that
+        # has receded a corridor's length deeper, narrow enough that it
+        # does not simply re-select the whole map.
+        self.declare_parameter("commit_radius", 5.0)
         # A goal is preempted when no frontier cell remains within this
         # distance of it (the area has been mapped while in transit).
         # Kept in step with Nav2's xy_goal_tolerance: the vehicle now
@@ -166,8 +276,22 @@ class Explorer(Node):
             self.get_parameter("bound_max_y").value,
         )
         self._blacklist_radius = self.get_parameter("blacklist_radius").value
+        self._large_frontier_cells = self.get_parameter(
+            "large_frontier_cells"
+        ).value
+        self._large_frontier_blacklist_radius = self.get_parameter(
+            "large_frontier_blacklist_radius"
+        ).value
+        self._large_frontier_attempts = self.get_parameter(
+            "large_frontier_attempts"
+        ).value
         self._goal_timeout = self.get_parameter("goal_timeout").value
         self._goal_invalidate_dist = self.get_parameter("goal_invalidate_dist").value
+        self._commit_radius = self.get_parameter("commit_radius").value
+        self._min_unknown_gain_m2 = self.get_parameter(
+            "min_unknown_gain_m2"
+        ).value
+        self._min_unknown_gain = 0  # in cells; set per map from resolution
         self._empty_evals_before_land = self.get_parameter(
             "empty_evals_before_land"
         ).value
@@ -209,11 +333,17 @@ class Explorer(Node):
         self._status = None
         self._pending_srv = None
         self._origin_set = threading.Event()
-        self._blacklist = []
+        self._blacklist = []  # (x, y, exclusion radius in metres)
         self._blacklist_clears_left = 2
+        # Cell count of the frontier the active goal came from, so a
+        # failure can size its own exclusion.
+        self._current_goal_size = 0
         self._goal_handle = None
         self._result_future = None
         self._current_goal_xy = None
+        # Set when a goal is dropped because its area was mapped from a
+        # distance; biases the next selection to keep the same heading.
+        self._preempted_goal_xy = None
         self._goal_sent_time = None
         self._goal_seq = 0
         self._reached_goal_xy = None
@@ -413,17 +543,32 @@ class Explorer(Node):
             return
 
         if self._state == State.WAIT_INTERFACES:
-            ready = (
-                self._arm_client.service_is_ready()
-                and self._mode_client.service_is_ready()
-                and self._takeoff_client.service_is_ready()
-                and self._nav_client.server_is_ready()
-                and self._map is not None
-                and self._origin_set.is_set()
-            )
-            if ready:
+            # Report what is missing, not just that something is. A
+            # startup race here looks identical from the outside to a
+            # vehicle that refuses to take off, and without this the
+            # only way to tell which interface never came up was to
+            # interrogate the graph by hand while the run sat idle.
+            missing = [
+                name
+                for name, ok in (
+                    ("arm service", self._arm_client.service_is_ready()),
+                    ("mode service", self._mode_client.service_is_ready()),
+                    ("takeoff service", self._takeoff_client.service_is_ready()),
+                    ("nav2 action server", self._nav_client.server_is_ready()),
+                    ("/map", self._map is not None),
+                    ("EKF origin", self._origin_set.is_set()),
+                )
+                if not ok
+            ]
+            if not missing:
                 self.get_logger().info("All interfaces ready")
                 self._state = State.SET_MODE
+                return
+            self._wait_ticks = getattr(self, "_wait_ticks", 0) + 1
+            if self._wait_ticks % 10 == 0:
+                self.get_logger().warning(
+                    f"Still waiting on: {', '.join(missing)}"
+                )
             return
 
         if self._state == State.SET_MODE:
@@ -561,19 +706,61 @@ class Explorer(Node):
         # anything outside the exploration boundary.
         min_x, max_x, min_y, max_y = self._bounds
         candidates = []
+        out_of_bounds = []
         for f in frontiers:
             x, y = cell_to_world(
                 f.goal_cell, info.origin.position.x, info.origin.position.y,
                 info.resolution,
             )
             if not (min_x <= x <= max_x and min_y <= y <= max_y):
-                continue
+                # Try another cell before giving up on the cluster.
+                #
+                # A frontier is represented by one cell chosen for how
+                # much unknown it faces, which pushes it hard against
+                # whatever wall the unknown lies behind. Discarding the
+                # whole cluster when that single cell falls outside the
+                # boundary throws away everything it borders: run 69
+                # rejected a 734-cell frontier because its
+                # representative landed at x = -9.93, 3 cm inside the
+                # west wall's footprint, while hundreds of its cells
+                # sat in open space. Widening the boundary would not
+                # help -- the planner cannot route into a wall either
+                # -- so re-pick the nearest cell that is genuinely in
+                # bounds.
+                alt = self._nearest_in_bounds(f, info)
+                if alt is None:
+                    out_of_bounds.append((x, y, f.size))
+                    continue
+                x, y, f = alt
             if any(
-                math.hypot(x - bx, y - by) < self._blacklist_radius
-                for bx, by in self._blacklist
+                math.hypot(x - bx, y - by) < br
+                for bx, by, br in self._blacklist
             ):
                 continue
             candidates.append((x, y, f))
+
+        # Say so when the boundary rejects something substantial.
+        #
+        # This filter is the only place a frontier leaves the pipeline
+        # without a word, and that silence cost three runs: at +/-9.5
+        # the largest frontier on the map -- 1021 cells opening into
+        # the unexplored west corridor at x = -9.80 -- was discarded
+        # every single cycle, and the logs showed only that it was
+        # never chosen. A rejection bigger than anything still in the
+        # running is the signature of a boundary cutting into the map
+        # rather than guarding its edge, so it is worth a warning.
+        if out_of_bounds:
+            biggest = max(out_of_bounds, key=lambda c: c[2])
+            largest_kept = max((f.size for _, _, f in candidates), default=0)
+            if biggest[2] >= max(largest_kept, 200):
+                self._oob_warned = getattr(self, "_oob_warned", 0) + 1
+                if self._oob_warned % 10 == 1:
+                    self.get_logger().warning(
+                        f"Boundary rejected a {biggest[2]}-cell frontier at "
+                        f"({biggest[0]:.2f}, {biggest[1]:.2f}); largest kept "
+                        f"is {largest_kept}. Bounds may be cutting into "
+                        f"the map."
+                    )
 
         self._publish_markers(candidates, info)
 
@@ -618,7 +805,12 @@ class Explorer(Node):
                             f"Frontier unchanged after {self._persist_count} "
                             "arrivals, blacklisting"
                         )
-                        self._blacklist.append(self._reached_goal_xy)
+                        # Full radius: a frontier that survived repeated
+                        # arrivals is unmappable from here, and its
+                        # neighbours almost always are too.
+                        self._blacklist.append(
+                            (*self._reached_goal_xy, self._blacklist_radius)
+                        )
                         self._persist_count = 0
                         self._last_persist_xy = None
                     else:
@@ -679,6 +871,16 @@ class Explorer(Node):
             # is exhausted the newest surviving frontier is whatever was
             # deferred most recently, which is the backtrack. Distance
             # only breaks ties among equally-recent frontiers.
+            # How much unknown each goal actually opens up. Cluster
+            # size is not a usable proxy: fog banded along an outer
+            # wall makes a large cluster that reveals almost nothing,
+            # and that is what the vehicle kept flying back to.
+            gain_field = unknown_gain(
+                grid, int(self._face_unknown_radius / info.resolution)
+            )
+            self._min_unknown_gain = int(
+                self._min_unknown_gain_m2 / (info.resolution ** 2)
+            )
             unreachable = 0
             tagged = []
             for x, y, f in candidates:
@@ -688,7 +890,7 @@ class Explorer(Node):
                     cost = 1e6  # tried last, never vetoed
                 tagged.append(
                     (self._been_there(x, y), self._frontier_age(x, y),
-                     cost, x, y, f)
+                     cost, x, y, f, int(gain_field[f.goal_cell]))
                 )
             if unreachable:
                 self.get_logger().info(
@@ -704,13 +906,41 @@ class Explorer(Node):
             # makes the exploration look like it is retracing itself.
             # Ranked last rather than discarded, so they are still
             # collected once the unvisited frontiers are gone.
-            tagged.sort(key=lambda t: (t[0], -t[1], t[2]))
-            candidates = [(x, y, f) for _, _, _, x, y, f in tagged]
             fresh = sum(1 for t in tagged if t[0] == 0)
+            tagged = rank_candidates(tagged, min_gain=self._min_unknown_gain)
+
+            # Honour the heading we were already committed to.
+            #
+            # If the last goal was dropped because its area got mapped
+            # from a distance, the exploration has not failed -- it has
+            # advanced, and the frontier has receded deeper into the
+            # space just revealed. Prefer a candidate near where we
+            # were going, so the vehicle carries on into the unmapped
+            # region instead of turning round for closer fog. Only
+            # applies for one selection, and only if something is
+            # actually out that way.
+            if self._preempted_goal_xy is not None:
+                px, py = self._preempted_goal_xy
+                # Partition by index: these tuples hold Frontier
+                # objects whose numpy `cells` make `in` / `==`
+                # ambiguous.
+                near_idx, far_idx = [], []
+                for i, t in enumerate(tagged):
+                    d = math.hypot(t[3] - px, t[4] - py)
+                    (near_idx if d <= self._commit_radius else far_idx).append(i)
+                if near_idx:
+                    self.get_logger().info(
+                        f"Continuing toward ({px:.2f}, {py:.2f}): "
+                        f"{len(near_idx)} frontier(s) still onward"
+                    )
+                    tagged = [tagged[i] for i in near_idx + far_idx]
+                self._preempted_goal_xy = None
             if fresh == 0 and tagged:
                 self.get_logger().info(
-                    "Only already-visited frontiers remain; going back for them"
+                    "Only already-visited frontiers remain; "
+                    "going back for the most informative first"
                 )
+            candidates = [(t[3], t[4], t[5]) for t in tagged]
 
         if not candidates:
             self._empty_evals += 1
@@ -750,12 +980,45 @@ class Explorer(Node):
         # straight-line proximity. Removed: one selection rule, the
         # measured one.
         x, y, f = candidates[0]
+        self._current_goal_size = int(f.size)
         self._send_goal(x, y, rx, ry)
 
 
     # ------------------------------------------------------------------
     # Frontier discovery order (depth-first bookkeeping)
     # ------------------------------------------------------------------
+    def _nearest_in_bounds(self, f, info):
+        """Re-pick a cluster's goal to the closest in-bounds cell.
+
+        Returns ``(x, y, frontier)`` with the frontier's ``goal_cell``
+        moved, or None if the whole cluster lies outside the boundary
+        -- in which case it really should be dropped.
+        """
+        min_x, max_x, min_y, max_y = self._bounds
+        ox, oy, res = (
+            info.origin.position.x, info.origin.position.y, info.resolution,
+        )
+        xs = ox + (f.cells[:, 1] + 0.5) * res
+        ys = oy + (f.cells[:, 0] + 0.5) * res
+        ok = (xs >= min_x) & (xs <= max_x) & (ys >= min_y) & (ys <= max_y)
+        idx = np.flatnonzero(ok)
+        if idx.size == 0:
+            return None
+        # Aim at the cluster's body, not at the cell nearest the one
+        # that was rejected. The rejected cell is against a wall by
+        # construction -- it was chosen for facing the most unknown --
+        # so its nearest in-bounds neighbour hugs the same wall and
+        # lands inside the costmap's inflated zone, where the planner
+        # aborts with "compute_path_to_pose" and Nav2 burns a
+        # backup-and-spin recovery. Run 69 stalled for five minutes in
+        # the south-west corner doing exactly that. The cell closest to
+        # the centroid sits in open frontier instead.
+        cr, cc = f.centroid
+        d = (f.cells[idx, 0] - cr) ** 2 + (f.cells[idx, 1] - cc) ** 2
+        best = idx[int(np.argmin(d))]
+        cell = (int(f.cells[best, 0]), int(f.cells[best, 1]))
+        return float(xs[best]), float(ys[best]), replace(f, goal_cell=cell)
+
     def _frontier_age(self, x, y):
         """Sequence number of when this frontier was first seen.
 
@@ -898,16 +1161,54 @@ class Explorer(Node):
 
         if not self._frontier_near(frontiers, info, gx, gy):
             self.get_logger().info("Goal area already mapped, re-planning")
+            # Remember where we were heading. The lidar reaches ~30 m
+            # across a 20 m maze, so the sensor outranges the flight:
+            # the region we set out for is usually mapped from a
+            # distance before we arrive, and this branch fires. Most
+            # goals end here.
+            #
+            # Re-ranking from scratch at that moment throws away the
+            # commitment. The frontier we were chasing has receded
+            # deeper into the space it just revealed, but that new
+            # frontier is now further from the vehicle than the
+            # residual fog behind it, so the score sends us backwards
+            # -- the vehicle turns around halfway to an unmapped
+            # region and returns to ground it has already covered.
+            # Keeping the heading lets the next selection prefer
+            # whatever lies onward before reconsidering the whole map.
+            self._preempted_goal_xy = (gx, gy)
             # Deliberately no cancel: sending the next goal preempts this
             # one at the action server, whereas cancelling halts the
             # controller and the copter must stop and re-accelerate.
-            # Most goals end here (the 30 m lidar outranges the flight),
-            # so that stop-go cost dominates the run.
             self._clear_goal()
 
     def _fail_current_goal(self):
         if self._current_goal_xy is not None:
-            self._blacklist.append(self._current_goal_xy)
+            gx, gy = self._current_goal_xy
+            # How many narrow exclusions this neighbourhood has already
+            # been granted.
+            spent = sum(
+                1
+                for bx, by, br in self._blacklist
+                if br < self._blacklist_radius
+                and math.hypot(gx - bx, gy - by) < self._blacklist_radius
+            )
+            if (
+                self._current_goal_size >= self._large_frontier_cells
+                and spent < self._large_frontier_attempts
+            ):
+                # Exclude the cell that failed, not the region it opens
+                # onto: a cluster this size has hundreds of other goal
+                # cells and the planner may well accept one of them.
+                radius = self._large_frontier_blacklist_radius
+                self.get_logger().info(
+                    f"Large frontier ({self._current_goal_size} cells), "
+                    f"attempt {spent + 1}/{self._large_frontier_attempts}: "
+                    f"excluding {radius} m around the failed goal only"
+                )
+            else:
+                radius = self._blacklist_radius
+            self._blacklist.append((*self._current_goal_xy, radius))
             self._goals_failed += 1
         self._clear_goal()
 

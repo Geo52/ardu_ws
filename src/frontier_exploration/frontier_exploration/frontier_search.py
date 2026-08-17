@@ -10,6 +10,7 @@ frontier cell nearest the cluster centroid (the centroid itself may fall
 in unknown or occupied space for concave clusters).
 """
 
+import math
 from collections import deque
 from dataclasses import dataclass, replace
 from typing import List, Tuple
@@ -245,6 +246,7 @@ def find_frontiers(
             max_cells=int(min_goal_clearance) + 5,
         )
 
+    free_mask = None  # built lazily, only if a goal needs nudging
     facing_unknown = None
     if face_unknown_radius > 0:
         facing_unknown = unknown_gain(grid, face_unknown_radius)
@@ -261,9 +263,58 @@ def find_frontiers(
                 grid, cell, occupied_min=occupied_min,
                 window=unknown_dilation + 5,
             ):
+                # Visibility is judged at the frontier cell; the goal
+                # the vehicle is actually sent to may need to sit a
+                # little further from the wall to be plannable.
+                if clearance is not None and clearance[cell] < min_goal_clearance:
+                    if free_mask is None:
+                        free_mask = (grid >= 0) & (grid <= free_max)
+                    cell = nudge_to_clearance(
+                        clearance, free_mask, cell, min_goal_clearance,
+                    )
                 selected.append(replace(f, goal_cell=cell))
                 break
     return selected
+
+
+def nudge_to_clearance(clearance, free, cell, min_cells, max_steps=10):
+    """Walk a goal cell away from walls until the planner can use it.
+
+    Frontier cells border unknown space, and unknown space nearly
+    always abuts a wall, so the chosen goal often sits inside the
+    costmap's inscribed radius. NavFn will not place the robot there
+    and returns no path at all: `compute_path_to_pose` aborts, the
+    vehicle stops with nothing to follow (Nav2 reports distance
+    remaining 0 while it is still halfway to the goal), and the
+    behaviour tree grinds through spin/wait/backup recoveries for
+    roughly half a minute before giving up. Run 70 lost 23 recovery
+    cycles to this.
+
+    Ranking already prefers roomy cells, but falls back to the least
+    cramped cell available when a cluster has no good one -- which is
+    still unplannable. Stepping the goal a few cells up the clearance
+    gradient, staying on known-free ground, keeps the frontier usable
+    instead of discarding it or dispatching a goal that cannot work.
+    """
+    rows, cols = clearance.shape
+    r, c = int(cell[0]), int(cell[1])
+    for _ in range(max_steps):
+        if clearance[r, c] >= min_cells:
+            break
+        best = (clearance[r, c], r, c)
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                nr, nc = r + dr, c + dc
+                if not (0 <= nr < rows and 0 <= nc < cols):
+                    continue
+                if not free[nr, nc]:
+                    continue
+                if clearance[nr, nc] > best[0]:
+                    best = (clearance[nr, nc], nr, nc)
+        if (best[1], best[2]) == (r, c):
+            break  # local maximum: nothing better adjacent
+        r, c = best[1], best[2]
+    return r, c
 
 
 def _candidate_order(
@@ -306,6 +357,119 @@ def _candidate_order(
     tight = np.flatnonzero(room < min_clearance)
     return np.concatenate(
         [roomy[np.argsort(primary[roomy])], tight[np.argsort(-room[tight])]]
+    )
+
+
+# Travel cost at or above which a frontier is treated as having no
+# coarse route. The explorer substitutes a sentinel rather than
+# dropping such a frontier, so this must stay below that sentinel and
+# far above any real distance across the maze (its diagonal is ~28 m).
+UNROUTABLE_COST = 1e5
+
+
+def _routable(cost) -> bool:
+    return math.isfinite(cost) and cost < UNROUTABLE_COST
+
+
+# Metres added to a frontier's travel cost when scoring cleanup work,
+# so that two nearby frontiers are separated mostly by how much they
+# reveal rather than by a few metres of approach.
+CLEANUP_DISTANCE_BIAS = 5.0
+
+
+def _cleanup_value(gain: int, cost: float) -> float:
+    """Unknown cells revealed per metre flown to reach them.
+
+    Ranking cleanup on raw size makes distance a tiebreaker only, so
+    the vehicle chases the single biggest frontier anywhere on the map
+    and then the next biggest, which is usually on the opposite side.
+    Run 68 dispatched goals at x = 9.67, then -10.04, then 9.71 --
+    three 20 m crossings of an already-mapped maze in a row.
+
+    Dividing by distance restores the trade-off without reopening the
+    starvation this ordering was introduced to fix: an unclearable
+    271-cell frontier 2 m away scores 39 against the 1045-cell west
+    corridor's 61 at 12 m, so the corridor still wins, while a
+    500-cell frontier 20 m off loses to a 300-cell one 3 m away.
+    """
+    if not _routable(cost):
+        return 0.0
+    return gain / (max(cost, 0.0) + CLEANUP_DISTANCE_BIAS)
+
+
+def _gain(t):
+    """Unknown cells a candidate would reveal.
+
+    Falls back to cluster size when the caller supplies no gain, which
+    keeps the ordering meaningful for callers that have not computed
+    one -- but size is a poor stand-in, see below.
+    """
+    return t[6] if len(t) > 6 and t[6] is not None else t[5].size
+
+
+def rank_candidates(tagged, min_gain=0):
+    """Order frontier candidates for dispatch.
+
+    ``tagged`` holds ``(been_there, age, cost, x, y, frontier[, gain])``
+    per candidate, where ``been_there`` is 1 if the goal sits in ground
+    the vehicle has already flown, ``age`` is the discovery sequence
+    number, ``cost`` is travel distance in metres, and ``gain`` is the
+    count of unknown cells near the goal.
+
+    **Rank by what a frontier reveals, not by how many cells it has.**
+    The two come apart badly. Measured across two captured maps, the
+    frontiers worth flying to revealed 2191-6313 unknown cells while
+    fog banded along the maze's outer wall revealed 195-836 -- a clean
+    separation. Cluster size does not track that at all: a 1871-cell
+    frontier revealed 11.4 m2 while a 10-cell one revealed 9.8 m2, and
+    a 452-cell one revealed 1.3 m2 of nothing. Ranking on size sends
+    the vehicle to long thin fog bands smeared along walls it has
+    already flown past, which is exactly what "it keeps going back to
+    places it has been" looks like from the outside.
+
+    ``min_gain`` demotes -- never drops -- candidates revealing less
+    than that many unknown cells, so they are still collected once
+    everything worthwhile is gone.
+
+    While any unvisited frontier remains, order is: somewhere new
+    first, then newest-discovered (depth-first), then nearest.
+
+    Once every candidate is in already-flown ground the vehicle is
+    backtracking to collect leftovers, and depth-first order stops
+    meaning anything -- it also becomes exploitable. A frontier whose
+    unknown lies behind an unconfirmed wall can never be cleared, so it
+    is rebuilt every cycle with a centroid that shifts by more than the
+    match radius, re-registers as newly discovered, and wins
+    newest-first forever. Measured on run 65: an unclearable line at
+    x = -6.9 held the lead for 30 consecutive evaluations while the
+    largest frontier on the map -- a 1045-cell opening into the
+    unexplored west corridor -- was never once selected. Ranking
+    cleanup by how much each frontier reveals cannot be starved that
+    way, because a frontier that stays unclearable does not grow.
+
+    Reachability still leads that key. The caller marks a frontier with
+    no coarse route by giving it an enormous ``cost`` rather than
+    dropping it -- a coarse estimate must not veto, since ranking it
+    wrong costs a detour while vetoing it wrong can end the run early.
+    Sorting on size alone silently discarded that signal: a large
+    unreachable frontier outranked a small reachable one, and run 67
+    spent 4 of its first 21 goals dispatching to frontiers the planner
+    could not route to, each burning a wait-and-backup recovery cycle
+    before being blacklisted. Ordering unroutable candidates last keeps
+    both properties.
+    """
+    if not tagged:
+        return []
+    backtracking = all(t[0] for t in tagged)
+    if backtracking:
+        return sorted(
+            tagged,
+            key=lambda t: (not _routable(t[2]), -_cleanup_value(_gain(t), t[2])),
+        )
+    # Depth-first, but never into a frontier that reveals nothing.
+    return sorted(
+        tagged,
+        key=lambda t: (t[0], _gain(t) < min_gain, -t[1], t[2]),
     )
 
 

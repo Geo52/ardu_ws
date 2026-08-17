@@ -477,6 +477,51 @@ pause rather than a risky manoeuvre.
 
 ---
 
+## 22. Depth-first order can be starved by a frontier that never clears
+
+**Symptom.** Late in run 65 the vehicle ping-ponged 10 m up and down a
+single wall face at x ≈ -6.9 — goals at y = -5.04, 4.81, -1.04, -2.64,
+5.31, 5.71, -4.94 in that order — for 30 consecutive evaluation cycles,
+then landed at 267.6 m², 20 m² short of the previous run. The largest
+frontier on the map, a 1045-cell opening into the completely unexplored
+west corridor, was never selected once.
+
+**Cause.** Frontier identity is by proximity: a cluster within
+`frontier_match_radius` (2.0 m) of a remembered one keeps its discovery
+sequence number, anything else is "newly discovered" and gets the next
+one. That is sound for a frontier that recedes as you map toward it.
+It breaks for a frontier whose unknown sits behind an *unconfirmed*
+wall, which can never be cleared: it is rebuilt every cycle with a
+centroid that shifts further than the match radius, so it re-registers
+as new, and the depth-first rule — prefer the newest — hands it the
+lead again. Recency is self-renewing for exactly the frontiers that
+deserve it least.
+
+**What it was not.** The obvious suspects were both wrong, and each
+cost real time. The region was not walled off: run 45's saved map has
+it 85% free, so it is reachable maze interior. And detection was not at
+fault either — replaying the captured run-65 map, the current detector
+*does* produce that 1045-cell frontier, and adding a travel-reachability
+filter (only seed from unknown that touches the robot's connected
+observed-passable component) yields an identical candidate set, 8
+clusters with the same goals. The bug was entirely in ranking.
+
+**Fix.** `rank_candidates()` in `frontier_search.py`. While any
+unvisited frontier remains, order is unchanged: new ground, then
+newest-discovered, then nearest. Once every candidate lies in
+already-flown ground the vehicle is backtracking for leftovers, where
+depth-first order carries no information — so rank by cluster size,
+then distance. That cannot be starved, because a frontier that stays
+unclearable does not grow. Regression tests assert the west-corridor
+case survives 40 consecutive re-registrations of the unclearable one.
+
+**Generalisation.** Any "prefer the most recent" rule needs either a
+bound on re-registration or a mode where it stops applying. Otherwise
+whatever regenerates fastest wins, and what regenerates fastest is
+usually what is broken.
+
+---
+
 ## Operational lessons
 
 **Orphaned processes are the sneakiest failure mode.** `ros2 launch`
