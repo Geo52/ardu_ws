@@ -847,6 +847,52 @@ vehicle happens to finish, and one run's figure is not evidence.
 
 ---
 
+## 30. Discovery is route-dependent, and the cleanup phase is what rescues it
+
+**Symptom.** A run at 337 m² looked stuck: `Only already-visited
+frontiers remain` cycle after cycle, goals going to leftovers along
+the south wall at y ≈ -9.7, while the south-east corridor sat at **0%**
+— 24.7 m² of unknown that four previous runs on the same configuration
+had mapped to 84-94%.
+
+**Cause, and it is not a parameter.** The corridor held **0.0 m² of
+free space**. A frontier is a free cell bordering unknown, so with
+nothing free inside it and only a 2.8 m² fog band at its mouth, no
+frontier could exist there — confirmed by sweeping the detector over
+the live grid at dilation 4, 5 and 6 against sight-line 65 and 90: six
+combinations, zero candidates into the corridor in every one. Its
+entrance *had* been observed (3.2 m² free, 8% unknown), but observing
+a doorway is not the same as resolving free space beyond it.
+
+So the vehicle was not refusing to go. It could not see that there was
+anywhere to go, and had correctly concluded every frontier it could
+see was in ground already flown.
+
+**What happened next.** Nothing was changed and the run recovered on
+its own: collecting leftovers eventually drifted the vehicle close
+enough to resolve free space inside the corridor, one frontier
+appeared, and the region unzipped from 0% to 90%. It landed at
+368.0 m² — the same figure as every other run on this configuration.
+
+**Two things worth keeping.**
+
+Frontier exploration cannot target a region whose interior it has
+never resolved, so *which* regions a run discovers depends on the
+route it happens to take. Four of five recent runs found this corridor
+early; this one did not, and the difference was not configuration.
+
+More useful: **the cleanup phase is load-bearing, not tidying.**
+Re-covering already-flown ground looks like pure waste — it consumes
+most of the wall time and adds no coverage while it runs — and the
+obvious efficiency win is to trim the blacklist retry passes and land
+sooner. That would have cost 25 m² here. The backtracking is what
+carries the vehicle past openings the first pass missed, so the
+apparently wasted tail is also the recovery mechanism for the
+limitation above. Measure what a phase is *for* before optimising it
+away.
+
+---
+
 ## Operational lessons
 
 **Orphaned processes are the sneakiest failure mode.** `ros2 launch`
