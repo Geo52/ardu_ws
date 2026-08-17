@@ -211,6 +211,53 @@ record. It was a corrupted map — localization had diverged past 7 m and
 the same physical space was drawn twice. Coverage exceeding the known
 maximum is a symptom, not an achievement.
 
+### Runs 70–80: the maze completed
+
+| Run | Coverage | Change under test | Outcome |
+|---|---|---|---|
+| 70 | 275.2 m² | baseline | SE corridor attacked through its wall; west strip lost to one abort |
+| 71 | 328.5 m² | dilation 6 → 3 | planner refused fresh ground; stranded |
+| 72 | 368.8 m² | `lethal_cost_threshold` 50 → 90 | complete, but not reproducible |
+| 73 | ~343 m² | repeat of 72 | stopped early by hand |
+| 74 | 314.2 m² | threshold 80 | southern corridor invisible to the detector |
+| 75 | 312.5 m² | obstacle-layer ranges | same; obstacle layer found to be inert |
+| 76 | 368.2 m² | scan heights + dilation 4 | complete |
+| 77 | 371.2 m² | repeat of 76 | complete; highest figure recorded |
+| 78 | 368.0 m² | sight-line threshold split | complete, 25 goals, no post-arrival dismissals |
+| 79 | 367.9 m² | repeat | complete, 58 goals |
+| 80 | 367.4 m² | repeat | complete, 32 goals |
+
+The maze is **~390 m² navigable** of 400 m² gross, so runs 76–80 are
+complete maps rather than partial ones, and the last three reproduce
+across different exploration orders.
+
+**What the numbers are worth.** Coverage and the failure counts
+reproduce; goal counts do not — 25, 58 and 32 for the same finished map
+under identical configuration. Endgame planner refusals ranged 5 to 112
+across runs that differed in nothing. An inference drawn from any single
+run's goal or refusal count is an inference about which corner the
+vehicle happened to finish in.
+
+**What was actually wrong.** Five defects, four of them the same
+mistake: a single constant answering two questions that had quietly
+diverged. `occupied_min` measuring distance to fog rather than wall;
+`lethal_cost_threshold` asked to separate fog from wall when the data
+cannot (measured: cells at 80–89 resolve free about twice as often as
+wall); Nav2's obstacle-layer height window, written for a ground robot,
+silently discarding every scan point from a vehicle flying at exactly
+its 2.0 m ceiling; and the sight-line test sharing a threshold with the
+dilation mask. The fifth was the dilation reach itself, which has to
+equal the thinnest wall — shorter and openings behind fog are invisible,
+longer and fog over an unconfirmed wall becomes a frontier on its far
+side.
+
+**Still open.** `track_unknown_space` defaults to false, so the planner
+treats unexplored space as free and routes confidently through it —
+sampled on a live plan, 221 of 544 poses crossed unmapped space while
+**zero** crossed a known wall. `inflation_radius: 1.0` puts about a
+third of the navigable area at inscribed cost, but the evidence for
+acting on it is weak for the reason above.
+
 ---
 
 ## 6. Verification, and why it mattered

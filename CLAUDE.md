@@ -104,12 +104,18 @@ stock maze's east wall has a 3 m gap the explorer escapes through).
 
 Textbook free-cell-adjacent-to-unknown finds *zero* frontiers on a
 Cartographer grid, because a band of intermediate-probability cells always
-separates free from unknown. Unknown space is dilated
-(`unknown_dilation`, currently 6) before intersecting with free space, and
-because that reaches through 0.2 m maze walls, each candidate is then
-verified with a Bresenham line to nearby unknown cells
-(`frontier_sees_unknown`). Goals are placed on a cell with real wall
+separates free from unknown. Unknown space is grown toward free space
+(`unknown_dilation`, currently 4 — set to the wall thickness in cells)
+before intersecting with it, and because that reaches as far as a 0.2 m
+wall, each candidate is verified with a Bresenham line to nearby unknown
+cells (`frontier_sees_unknown`). Goals are placed on a cell with real wall
 clearance (`min_goal_clearance`), not on the centroid-nearest cell.
+
+**The ray test uses its own threshold.** `LOS_WALL_MIN` (65) is
+deliberately below `WALL_MIN` (90): growing unknown must be permissive or
+the fog over a corridor's opening blocks it, while testing for a barrier
+must be strict or a half-observed wall stops nothing. One constant serving
+both sent the vehicle into one corridor to map the next.
 
 ### Ranking has two modes
 
@@ -128,9 +134,16 @@ re-registers as "newly discovered" every cycle and holds the lead forever
   entry before touching SLAM config, Nav2 tuning, the DDS namespace, or
   the ranking rules; most of the non-obvious code exists because of one of
   them. `docs/PROJECT_REPORT.md` is the narrative companion.
-- **`README.md` lags the code in places** — its selection description
-  predates the two-mode ranking, and its test count predates the current
-  38. Trust the source and the integration notes.
+- **When a parameter sweep shows every value failing in a different
+  direction, stop sweeping.** It means one constant is answering two
+  questions that have diverged. This has happened four times here
+  (integration notes 18, 24–27, 26, 29): distance-to-wall vs
+  distance-to-fog, fog vs wall in the costmap, a ground robot's sensor
+  height applied to a flying one, and dilation reach vs sight line. Each
+  time the search for a better value failed because none existed.
+- **Quote coverage with a ground-truth drift reading beside it.** The
+  project's best result and its worst divergence (run 35, 332.9 m² of
+  fabricated map) look identical on paper. `scripts/drift_check.py`.
 - **Thresholds are chosen from measured data, and the comment says so.**
   Parameter declarations in `explorer_node.py:77-209` carry multi-paragraph
   rationale (which run, which map, what was measured). Preserve that when

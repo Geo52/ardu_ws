@@ -8,10 +8,18 @@ maze, explores it on its own, and lands when nothing is left to map —
 with **no GPS anywhere in the loop**. ArduPilot's EKF3 fuses
 Cartographer's SLAM pose as ExternalNav for position, velocity, and yaw.
 
-**Validated end to end in SITL**: a complete run maps 257.6 m² of maze
-interior — essentially all of it — reaching 49 of 60 dispatched goals
-with no navigation stalls, then lands and disarms by itself. Peak
-localization error against Gazebo ground truth was 1.63 m.
+**Validated end to end in SITL**: the maze comes out **complete** —
+367–368 m² of a ~390 m² navigable interior — across three consecutive
+runs, after which the vehicle lands and disarms by itself. Peak
+localization error against Gazebo ground truth stays under 1 m in a
+typical run, and every coverage figure here is quoted with a
+ground-truth drift check beside it, because the project's highest
+recorded coverage and its worst divergence looked identical on paper
+(see `docs/INTEGRATION_NOTES.md`).
+
+Goal counts vary widely between runs of identical configuration — 25
+to 58 for the same finished map — so treat coverage and the failure
+counts as the reproducible numbers and goal counts as noise.
 
 ## How it works
 
@@ -52,16 +60,26 @@ Two details matter on real Cartographer maps and are the difference
 between this working and finding nothing at all:
 
 - **Unknown dilation.** Cartographer never places free cells directly
-  against unknown ones; a ~2-cell rim of intermediate-probability cells
-  always separates them. Plain free/unknown adjacency therefore finds
-  *zero* frontiers. Unknown space is dilated (default 3 cells) before
-  intersecting with free space.
-- **Line-of-sight filtering.** Dilating by 3 cells lets frontiers leak
-  through thin walls — a 0.2 m maze wall is only 4 cells thick — so the
-  vehicle chases unknown space it can never reach from this side. Each
-  candidate is verified with a Bresenham line to nearby unknown cells;
-  the frontier survives only if some line reaches unknown space without
-  crossing an occupied cell.
+  against unknown ones; a band of intermediate-probability cells always
+  separates them. Plain free/unknown adjacency therefore finds *zero*
+  frontiers. Unknown space is grown toward free space (default 4 cells,
+  masked at walls) before intersecting with it. The band is not a fixed
+  width — thin where the lidar swept closely, ten cells or more where
+  an area was glimpsed from a distance — so too short a reach leaves
+  whole corridors invisible.
+- **Line-of-sight filtering.** A reach as wide as a wall lets frontiers
+  leak *through* one — a 0.2 m maze wall is 4 cells at 0.05 m/cell — so
+  the vehicle is sent into one corridor to map the next. Each candidate
+  is verified with a Bresenham line to nearby unknown cells; it
+  survives only if some line reaches unknown space without crossing a
+  barrier.
+- **Two thresholds, not one.** The ray test uses `LOS_WALL_MIN` (65),
+  deliberately lower than the `WALL_MIN` (90) that defines a wall
+  everywhere else. These are different questions and no single value
+  answers both: growing unknown must be permissive or the fog over a
+  corridor's opening blocks it, while testing for a barrier must be
+  strict or a half-observed wall stops nothing. Fog has to count as
+  passable for the first and as a barrier for the second.
 
 Fragments of a frontier band are merged when within `merge_gap` cells of
 each other, so a broken one-cell-wide band is one cluster rather than a
@@ -74,14 +92,29 @@ EXPLORE → LAND → DONE`) driving the vehicle through the ArduPilot DDS
 services, plus a frontier policy re-evaluated every `eval_period`
 seconds as the map updates:
 
-- The highest-utility candidate is dispatched to Nav2 as a
+- The top-ranked candidate is dispatched to Nav2 as a
   `NavigateToPose` goal.
-- **Utility, not proximity**: candidates are scored by unknown area
-  revealed per metre actually flown, with distance measured by a
-  breadth-first expansion around walls rather than in a straight line.
-  In a maze the two differ wildly — measured on a real map, the nearest
-  frontier by straight line needed 33 m of flying while another at the
-  same apparent distance needed 18 m.
+- **Two ranking modes**, in `rank_candidates()`. While any candidate
+  sits in ground the vehicle has not flown, order is: somewhere new
+  first, then anything revealing at least `min_unknown_gain_m2`, then
+  newest-discovered (depth-first), then nearest by travel cost. New
+  frontiers appear where the vehicle is currently revealing space, so
+  preferring the newest drives it down one branch and falls back to
+  the most recently deferred opening when that branch ends.
+- Once *every* candidate lies in already-flown ground, the vehicle is
+  collecting leftovers and depth-first order carries no information —
+  worse, it is exploitable, since a frontier that can never be cleared
+  re-registers as "newly discovered" every cycle and holds the lead
+  forever. Ranking then switches to unknown revealed per metre flown,
+  which cannot be starved that way because an unclearable frontier
+  does not grow.
+- Travel cost throughout is a breadth-first expansion **around walls**,
+  not straight-line distance. In a maze the two differ wildly —
+  measured on a real map, the nearest frontier by straight line needed
+  33 m of flying while another at the same apparent distance needed
+  18 m. An unroutable candidate is ranked last rather than dropped: a
+  coarse estimate that is wrong costs a detour one way and ends the
+  mission early the other.
 - **Preemption**: a goal whose frontier has been mapped away while in
   transit is cancelled and replaced.
 - **Blacklisting**: goals that Nav2 aborts, that time out, or that the
@@ -184,15 +217,16 @@ cylinder.
 | Parameter | Default | Purpose |
 |---|---|---|
 | `takeoff_alt` | 2.0 | Exploration altitude (m), below the 3.25 m maze walls |
-| `unknown_dilation` | 3 | Cells to dilate unknown space; must stay below the thinnest wall thickness in cells |
+| `unknown_dilation` | 4 | Cells to grow unknown space toward free space. Set to the thinnest wall in cells (0.2 m = 4 at 0.05 m/cell): shorter and openings behind a wide fog band are invisible, longer and fog over an unconfirmed wall becomes a frontier on its far side |
 | `min_frontier_size` | 10 | Smallest cluster treated as a real frontier |
 | `min_goal_clearance` | 0.5 | Keep goals this far (m) from walls, or the planner cannot place the vehicle there at all |
 | `gain_radius` | 6.0 | Radius (m) over which unknown area is counted when scoring a frontier |
 | `goal_invalidate_dist` | 1.5 | A goal is preempted when no frontier cell remains this close (m); kept in step with Nav2's `xy_goal_tolerance` |
 | `goal_timeout` | 90.0 | Blacklist a goal not reached within this many seconds |
-| `blacklist_radius` | 0.8 | Candidates within this distance (m) of a blacklisted point are skipped |
+| `blacklist_radius` | 2.5 | Candidates within this distance (m) of a blacklisted point are skipped. Large frontiers get a much narrower exclusion — see `large_frontier_blacklist_radius` |
+| `los_occupied_min` | 65 | Occupancy that blocks a *sight line*, deliberately below the 90 that defines a wall. One constant could not serve both: growing unknown must be permissive, testing for a barrier must be strict |
 | `empty_evals_before_land` | 5 | Consecutive empty evaluations before landing |
-| `bound_min/max_x/y` | ±9.5 | Exploration boundary in the map frame — must sit *inside* the ±10 m outer wall |
+| `bound_min/max_x/y` | ±9.9 | Exploration boundary in the map frame — just inside the ±10 m outer wall. Take the extent from the world file, never from a map: a map cannot tell you how big the world is when the unexplored part is what you are measuring |
 | `ap_ns` | `/ap/v1` | ArduPilot DDS namespace |
 
 Nav2 tuning lives in `config/navigation.yaml`. Two settings there
@@ -203,9 +237,29 @@ is irrelevant. Demanding tighter arrival caused the vehicle to hover
 short of goals it had effectively reached, cycle through Nav2
 recoveries and abort — arrivals rose from 4% to 81% of goals when this
 was relaxed. The inflation radius
-(0.7 m) and speed cap (0.4 m/s) are deliberately conservative: with the
+(1.0 m) and speed cap (0.4 m/s) are deliberately conservative: with the
 stock values the copter clips maze corners and ArduPilot triggers its
 crash detector (`Crash: Disarming: AngErr=44>30`).
+
+Three further settings there are not tuning but corrections, and each
+cost several runs to find:
+
+- `lethal_cost_threshold: 90`. At the stock 50 the costmap treats
+  Cartographer's fog as solid wall — two thirds of its "walls" were
+  fog — and with a 1 m inflation the planner refuses freshly explored
+  ground entirely. Measured, no threshold in the fog band separates
+  wall from free (cells at 80–89 resolve free about twice as often as
+  wall), which is why the next two matter more than this one.
+- `obstacle_max_range: 20.0` / `raytrace_max_range: 25.0`. The Nav2
+  defaults are 2.5 m and 3.0 m against a 30 m lidar, so beyond 2.5 m
+  the planner knew about walls only through the probability guess
+  above.
+- `min_obstacle_height: -5.0` / `max_obstacle_height: 10.0`, on **both**
+  costmaps. The defaults are 0.0–2.0 m applied to the observation's z
+  in the costmap frame — fine for a ground robot at 0.2 m, fatal for a
+  copter flying at exactly `takeoff_alt` 2.0 m. Every scan point was
+  silently discarded and the obstacle layer contributed *nothing*: the
+  count of cells it added over the static map was exactly zero.
 
 ## Tests
 
@@ -213,9 +267,16 @@ crash detector (`Crash: Disarming: AngErr=44>30`).
 python3 -m pytest src/frontier_exploration/test -q
 ```
 
-14 tests covering frontier detection (including the Cartographer grey
+38 tests covering frontier detection (including the Cartographer grey
 rim and thin-wall leak cases that caused real failures), clustering,
-line-of-sight filtering, and grid-to-world conversion.
+line-of-sight filtering, ranking in both modes, and grid-to-world
+conversion.
+
+Run them from the package directory. `install/` is a plain copy rather
+than a symlink install, so once `install/setup.bash` is sourced,
+`import frontier_exploration` resolves to the *installed* copy and
+running pytest from the workspace root tests the last build instead of
+the working tree.
 
 ## Further reading
 
