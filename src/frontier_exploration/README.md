@@ -207,11 +207,59 @@ A full run takes roughly 10–15 minutes of wall time.
 Launch arguments: `gui:=false` (no Gazebo GUI), `rviz:=false`,
 `takeoff_alt:=2.5`.
 
-RViz comes up on this package's own config, so the algorithm's view is
-already there: frontier cells in cyan, candidate goals as orange
-spheres, the active goal as a green cylinder, on
-`/frontier_explorer/frontiers`. Watching what the policy is *considering*
-rather than only where the vehicle went is most of the debugging.
+RViz comes up on this package's own config
+(`rviz/frontiers.rviz`), so the algorithm's view is already there.
+
+## Reading the RViz view
+
+Watching what the policy is *considering* — rather than only where the
+vehicle went — is most of the debugging, and several real failures are
+obvious on screen and invisible in the log.
+
+**Frontier markers**, published by the explorer on
+`/frontier_explorer/frontiers`:
+
+| Marker | Colour | What it means |
+|---|---|---|
+| Small points, one per grid cell | **cyan** | Every cell the detector classified as frontier: free space bordering unknown |
+| 0.3 m spheres | **orange** | One per cluster — the goal that cluster would be flown to if it were selected |
+| 1.5 m cylinder | **green** | The goal currently dispatched to Nav2 |
+
+The relationship between the three is the useful part. Cyan is what
+*detection* found, orange is where the goal landed after clearance and
+unknown-facing selection, green is what *ranking* chose out of all the
+orange. An orange sphere sitting a metre inside white space away from
+its cyan band is correct rather than a bug: the goal has to be
+somewhere the planner can place the vehicle, which a frontier cell
+against a wall is not.
+
+**The occupancy grid** (`/map`): white free, black wall, mid-grey
+unknown, and a pale blue-grey band between them — Cartographer's
+partially-observed *fog*, cells it has seen but not resolved. A wall
+the vehicle has only glimpsed from a distance renders in that band
+rather than black, which is precisely why no occupancy threshold can
+classify it (integration note 27) and why the detector needs two
+different thresholds rather than one.
+
+**Costmap layers** use RViz's cost palette, not the map's greyscale:
+magenta lethal, red across the inscribed region, then a blue-to-cyan
+gradient fading out over the inflation radius. The magenta extends
+well beyond the map's black walls — that is `inflation_radius: 1.0`,
+and it is why roughly a third of the navigable area is unavailable to
+the planner.
+
+**Two things worth looking for specifically:**
+
+- Cyan in a corridor whose grey unknown lies on the *other side of a
+  wall*. That is the through-wall frontier of integration note 29 —
+  the vehicle will fly there, arrive, and find the frontier still
+  standing.
+- The global plan crossing grey unmapped space. `track_unknown_space`
+  defaults to false, so the planner treats unexplored area as free and
+  routes confidently through it; measured on one live plan, 221 of 544
+  poses crossed unmapped space while none crossed a known wall. This
+  is what "it's routing through walls" turns out to be, and it is
+  still open.
 
 ## Key parameters
 
