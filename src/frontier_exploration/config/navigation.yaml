@@ -155,6 +155,42 @@ global_costmap:
       # Note the failure gets worse the better exploration works: fog is
       # what a map is made of before it settles, so pushing hard into
       # new ground is exactly what fills the costmap with false walls.
+      #
+      # 90 was the first correction and overshot. A wall seen only at
+      # distance or at a grazing angle has not yet reached 90, so the
+      # planner cannot see it -- and the consequence is not merely a
+      # collision risk. A straight line through a wall the costmap
+      # reads as free is *cheaper* than the way round, so the planner
+      # prefers it, hands the controller a route the vehicle cannot
+      # fly, and the goal burns its 90 s timeout and is blacklisted.
+      # Runs 72 and 73 both showed it; in 73 it cost the last region of
+      # the maze, which sat reachable and unvisited while the planner
+      # kept proposing a shortcut through the wall beside it.
+      #
+      # So an under-believed wall loses coverage in the same way an
+      # over-believed one does, just later and with a crash risk
+      # attached. 80 was tried next and run 74 still routed through
+      # walls, which prompted measuring the thing all three values were
+      # guessing at. Taking run 72's mid-run map and its final one and
+      # asking what each fog cell became:
+      #
+      #   fog band   cells   -> free   -> wall   unresolved
+      #     26-49     2231      73%       3%        24%
+      #     50-64     3762      40%       7%        53%
+      #     65-79     1555      33%      18%        50%
+      #     80-89     1351      36%      19%        45%
+      #
+      # No value in that band separates the two. Even at 80-89, the
+      # most wall-like fog there is, a cell is nearly twice as likely
+      # to resolve free as to resolve wall. Occupancy alone cannot
+      # decide this, so 50, 80 and 90 all had to fail, each in its own
+      # direction.
+      #
+      # Hence 90 here and the ranges on the obstacle layer above: let
+      # the static layer believe only what has consolidated, and let
+      # live scans mark what the lidar is looking at right now. On this
+      # data 90 is the better-calibrated static threshold; it was only
+      # dangerous while nothing else was marking walls at all.
       lethal_cost_threshold: 90
       always_send_full_costmap: True
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
@@ -170,6 +206,42 @@ global_costmap:
           clearing: True
           marking: True
           data_type: "LaserScan"
+          # Without these, Nav2's defaults apply -- obstacle_max_range
+          # 2.5 m and raytrace_max_range 3.0 m -- so a 30 m lidar was
+          # marking obstacles only within 2.5 m of the vehicle. Beyond
+          # that the planner knew about walls solely through the static
+          # layer, i.e. through Cartographer's occupancy, where a wall
+          # the vehicle has merely glimpsed is still fog and no lethal
+          # threshold can classify it (see the table below).
+          #
+          # That is what "it routes through walls" was: not a threshold
+          # set too high, but a planner with no live obstacle data past
+          # 2.5 m, confidently drawing a straight line through geometry
+          # it could see perfectly well but was not being told about.
+          #
+          # Marking at sensor range replaces a probability guess with
+          # an observation: if the beam terminates there now, it is a
+          # wall now, whatever the map's confidence has settled on.
+          obstacle_max_range: 20.0
+          raytrace_max_range: 25.0
+          # ...and the ranges alone did nothing, because the height
+          # filter was discarding every point before range mattered.
+          #
+          # Nav2 defaults to min_obstacle_height 0.0 / max_obstacle
+          # _height 2.0, applied to the observation's z in the costmap
+          # frame. That is written for a ground robot whose lidar sits
+          # at 0.2 m. This one flies at takeoff_alt, 2.0 m, so its scan
+          # projects to z ~= 2.0 -- exactly the ceiling -- and every
+          # point was dropped. Measured on run 75: cells lethal in the
+          # costmap but not wall in the static map, i.e. everything the
+          # obstacle layer contributed, came to precisely zero.
+          #
+          # A flying vehicle's scan height is its altitude, which is a
+          # parameter, so any fixed window is wrong the moment someone
+          # changes takeoff_alt. Open it wide instead: the 2D lidar
+          # only reports what it can see anyway.
+          min_obstacle_height: -5.0
+          max_obstacle_height: 10.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         # Radius stays wide so planned paths prefer corridor centres,
@@ -211,7 +283,13 @@ local_costmap:
         observation_sources: scan
         scan:
           topic: /scan
-          max_obstacle_height: 2.0
+          # Was 2.0, which silently discarded every scan point: the
+          # vehicle flies at 2.0 m, so its observations sit at the
+          # ceiling of the window. Same defect as the global costmap's
+          # obstacle layer above, and worse here -- this is the layer
+          # the controller uses to avoid hitting things.
+          min_obstacle_height: -5.0
+          max_obstacle_height: 10.0
           clearing: True
           marking: True
           data_type: "LaserScan"
