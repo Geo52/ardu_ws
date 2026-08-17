@@ -556,6 +556,30 @@ goals hard against a wall face still appear at 3. The line-of-sight
 filter is what is supposed to catch them, and it lets them through
 wherever the mapped wall has an unobserved gap for a ray to slip.
 
+**Update: 3 was too short, and the setting is now 4.** Runs 74 and 75
+both landed with the same 50.4 m² southern corridor 97% unknown, and
+replaying run 75's final map at the moment it chose to land shows the
+detector was not being overruled — it had nothing to offer:
+
+| Dilation | Clusters on the whole map | Into the missed corridor |
+|---|---|---|
+| 3 | 1 | 0 |
+| 4 | 12 | 1 (66 cells) |
+| 5 | 18 | 1 (165 cells) |
+| 6 | 19 | 1 (257 cells) |
+
+The corridor's opening lies behind a fog band wider than three cells,
+so at reach 3 it is invisible. 4 is the least reach that sees it, and
+equals the wall thickness rather than the 1.5× that caused the
+through-wall goals above. Run 76 then mapped the whole maze —
+368.2 m² with unknown cells down 62% against the previous best.
+
+**The general shape.** Too short and openings behind fog are
+invisible; too long and fog over an unconfirmed wall becomes a
+frontier on its far side. Both failures cost a corridor, and the
+parameter has to be set to the environment's thinnest wall, not to
+how much fog you wish you could see across.
+
 **Generalisation worth keeping.** Any reach across unknown space needs
 a bound tied to the thinnest barrier in the environment, not to how
 much fog you want to see across. The two requirements conflict, and
@@ -646,6 +670,112 @@ from both sides — believe fog and you cannot move, disbelieve it and
 you fly into things. Anything between 80 and 89 buys access at the
 price of wall fidelity, and the right value is the one where the fog
 band ends, measured on a real map, not a round number.
+
+---
+
+## 26. The obstacle layer was switched off by its height filter
+
+**Symptom.** After entry 25, the planner still routed through walls at
+every threshold tried — 50, 80 and 90 — and setting the obstacle
+layer's ranges to sensor range changed nothing at all.
+
+**Cause.** The layer was contributing nothing whatsoever. Comparing
+`/global_costmap/costmap` against `/map`, the count of cells lethal in
+the costmap but *not* wall in the static map — everything the obstacle
+layer adds — was exactly **0**, and the costmap's lethal total (2834)
+equalled the map's wall count (2834) to the cell.
+
+`ObstacleLayer` defaults to `min_obstacle_height: 0.0` and
+`max_obstacle_height: 2.0`, applied to the observation's z in the
+costmap frame. That is written for a ground robot whose lidar sits at
+0.2 m. This vehicle **flies at `takeoff_alt`, 2.0 m**, so every scan
+point landed exactly at the ceiling of the window and was discarded.
+The local costmap set the same 2.0 explicitly, so the controller was
+equally blind.
+
+**Fix.** `min_obstacle_height: -5.0`, `max_obstacle_height: 10.0` on
+both costmaps. Live scan marks went from 0 to 559 immediately on the
+next run.
+
+**Why the ranges mattered too, but second.** The defaults are
+`obstacle_max_range: 2.5` and `raytrace_max_range: 3.0` against a 30 m
+lidar, so even with the height filter open the planner would only have
+learned about obstacles within 2.5 m. Both settings are wrong for this
+vehicle; the height filter is what made the layer inert.
+
+**Generalisation.** A costmap layer that silently contributes nothing
+looks exactly like a costmap layer that is working — no warning, no
+error, everything simply relies on the static map. The check is one
+query: count the cells the layer adds over the static map, and if it
+is zero, the layer is off, whatever the config says.
+
+---
+
+## 27. Fog cannot be classified by any threshold
+
+**Method.** Take a mid-run map and the final map from the *same* run
+(so the frames align), and ask what each fog cell became.
+
+| Fog band | Cells | → free | → wall | → unresolved |
+|---|---|---|---|---|
+| 26-49 | 2231 | 73% | 3% | 24% |
+| 50-64 | 3762 | 40% | 7% | 53% |
+| 65-79 | 1555 | 33% | 18% | 50% |
+| 80-89 | 1351 | 36% | 19% | 45% |
+
+**Result.** No value in the band separates wall from free. Even at
+80-89 — the most wall-like fog there is — a cell is nearly twice as
+likely to resolve free as to resolve wall.
+
+**Consequence.** Entries 24 and 25 were both attempts to find a
+threshold that works, and neither could have succeeded: 50 blocked
+everything, 90 believed nothing, 80 failed in both directions at once.
+The parameter is being asked a question the data cannot answer.
+
+**What actually resolves it** is not a better threshold but a
+different source of evidence — live scans marking what the sensor is
+looking at right now (entry 26). Occupancy probability answers "what
+has this cell usually looked like"; the planner needs "is there a wall
+there now", and only the sensor knows.
+
+---
+
+## 28. "Routing through walls" was mostly planning through the unknown
+
+**Symptom.** Paths visibly crossing walls in RViz, reported across
+four consecutive runs and blamed in turn on the lethal threshold
+(entry 25) and the inert obstacle layer (entry 26).
+
+**Cause.** Neither, mostly. Sampling the live `/plan` against the map
+settles it in one query:
+
+```
+plan: 544 poses
+  through KNOWN WALL (map >= 90):    0
+  through fog (50-89):               5
+  through UNKNOWN (unmapped):      221
+  through free:                    318
+```
+
+Not one pose crossed a known wall. 41% of the path ran through
+*unexplored* space, because `track_unknown_space` defaults to false
+and unknown cells are therefore treated as **free**. The planner draws
+confident straight lines across regions it has never seen, and where a
+wall happens to stand in one, the path crosses it. On screen that is
+indistinguishable from ignoring a wall it can see.
+
+**Status.** Unresolved. `track_unknown_space: true` is the candidate,
+but frontier goals sit on the unknown boundary by definition, so the
+planner must still be permitted to enter unknown space or the run-71
+stranding returns in a new form.
+
+**Lesson, and it cost four runs.** Two plausible mechanisms were
+available and both were real defects, so fixing them felt like
+progress and the symptom persisting felt like the fix being
+insufficient. The question "what is the path actually crossing" was
+answerable at any point in about forty seconds. Reach for the
+observation that discriminates between hypotheses before fixing the
+one that seems most likely.
 
 ---
 

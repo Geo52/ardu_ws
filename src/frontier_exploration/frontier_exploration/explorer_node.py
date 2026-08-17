@@ -110,7 +110,28 @@ class Explorer(Node):
         # was actually missed. Note the leak is not unique to 6 -- goals
         # hard against a wall face appear at 3 as well -- so this
         # narrows the false attractor rather than eliminating it.
-        self.declare_parameter("unknown_dilation", 3)
+        #
+        # Then 4, because 3 cannot see past a wide fog band and that
+        # costs whole corridors. Runs 74 and 75 both landed with the
+        # same 50.4 m2 southern corridor 97% unknown, and the detector
+        # was not being overruled -- it had nothing to offer. Replaying
+        # run 75's final map at the moment it decided to land:
+        #
+        #   dilation  clusters on the map  into the missed corridor
+        #          3          1                    0
+        #          4         12                    1  (66 cells)
+        #          5         18                    1  (165 cells)
+        #          6         19                    1  (257 cells)
+        #
+        # 4 is the least reach that sees it at all, and equals the wall
+        # thickness rather than the 1.5x that produced the through-wall
+        # goals of run 70. That is the whole trade in one number: too
+        # short and openings behind fog are invisible, too long and fog
+        # over an unconfirmed wall becomes a frontier on the far side.
+        # Fog is ambiguous between the two and no reach setting can
+        # resolve it -- this picks the smallest value that does not
+        # blind the detector.
+        self.declare_parameter("unknown_dilation", 4)
         # Exploration boundary (map frame), set just outside the maze's
         # outer wall.
         #
