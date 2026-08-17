@@ -237,7 +237,8 @@ is irrelevant. Demanding tighter arrival caused the vehicle to hover
 short of goals it had effectively reached, cycle through Nav2
 recoveries and abort — arrivals rose from 4% to 81% of goals when this
 was relaxed. The inflation radius
-(1.0 m) and speed cap (0.4 m/s) are deliberately conservative: with the
+(1.0 m) and speed cap (0.7 m/s, 0.8 m/s resultant) are deliberately
+conservative: with the
 stock values the copter clips maze corners and ArduPilot triggers its
 crash detector (`Crash: Disarming: AngErr=44>30`).
 

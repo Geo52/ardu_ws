@@ -283,9 +283,36 @@ synthetic one.
 
 ## 7. Where it stands
 
-The system reliably takes off, explores most of the maze with a
-centimetre-accurate map, and lands on its own. Best complete run:
-291.7 m² with an autonomous landing. Most recent: 288.1 m².
+The system takes off, maps the maze **complete**, and lands on its own.
+Runs 76–81 all finished at 367–371 m² of a ~390 m² navigable interior,
+reproducing across different exploration orders, with no crash-detector
+events and no EKF failsafes in any of them. Peak localization error
+against ground truth stays under 1 m in a typical run, with occasional
+1.4 m transients in the southern corridor that recover once the vehicle
+settles.
+
+Everything below this paragraph documents the state before that, and is
+kept because the reasoning is what generalises. Two entries in it were
+superseded by the runs in §5 and are marked as such.
+
+**What is still open**, in the order worth taking:
+
+- `track_unknown_space` defaults to false, so the planner treats
+  unexplored space as free and routes straight through it. Sampled on a
+  live plan: 221 of 544 poses crossed unmapped space, **zero** crossed a
+  known wall. This is what "it's routing through walls" actually was,
+  after two other explanations were tried and discarded.
+- `large_frontier_cells: 400` has been inert since the dilation moved
+  below 6, because clusters no longer reach that size. Recalibrate to
+  the sizes the current detector produces, or delete it.
+- `inflation_radius: 1.0` puts about a third of the navigable area at
+  inscribed cost. Tempting, but the endgame refusal count it would be
+  justified by ranges 5 to 112 across runs that differ in nothing, so
+  there is no evidence to act on yet.
+- `acc_lim_x: 2.5` and `acc_lim_y: 0.0` in `navigation.yaml` each sit
+  beside a comment arguing for a different value (1.0, and non-zero for
+  a holonomic vehicle). One of the two is wrong in each case and it is
+  not clear which.
 
 **The real blocker was the exploration boundary, and it hid for six
 runs.** `bound_min_x = -9.5` on a maze whose free space reaches
