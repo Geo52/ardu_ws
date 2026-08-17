@@ -132,6 +132,20 @@ class Explorer(Node):
         # resolve it -- this picks the smallest value that does not
         # blind the detector.
         self.declare_parameter("unknown_dilation", 4)
+        # Occupancy that blocks a sight line, kept separate from the one
+        # that stops the dilation (frontier_search.LOS_WALL_MIN vs
+        # WALL_MIN). Reach 4 equals the wall thickness, so unknown in one
+        # corridor can just touch free space in the next one, and at a
+        # shared threshold of 90 the half-observed wall between them
+        # blocks no ray -- the vehicle is then sent into corridor 2 to
+        # map corridor 1, arrives, and the frontier survives.
+        #
+        # Measured on run 75's map, tightening only this to 65: 8 of 12
+        # clusters dropped, and every one of them was hard against an
+        # outer wall or across the interior wall at y = -3.5. The four
+        # that survived were interior, including the corridor a shorter
+        # dilation cannot see at all.
+        self.declare_parameter("los_occupied_min", 65)
         # Exploration boundary (map frame), set just outside the maze's
         # outer wall.
         #
@@ -279,6 +293,7 @@ class Explorer(Node):
         self._free_max = self.get_parameter("free_max").value
         self._min_frontier_size = self.get_parameter("min_frontier_size").value
         self._unknown_dilation = self.get_parameter("unknown_dilation").value
+        self._los_occupied_min = self.get_parameter("los_occupied_min").value
         self._marker_cell_budget = self.get_parameter("marker_cell_budget").value
         self._gain_radius = self.get_parameter("gain_radius").value
         self._frontier_match_radius = self.get_parameter(
@@ -717,6 +732,7 @@ class Explorer(Node):
             min_size=self._min_frontier_size,
             unknown_dilation=self._unknown_dilation,
             require_line_of_sight=True,
+            los_occupied_min=self._los_occupied_min,
             min_goal_clearance=self._min_goal_clearance / info.resolution,
             face_unknown_radius=int(
                 self._face_unknown_radius / info.resolution

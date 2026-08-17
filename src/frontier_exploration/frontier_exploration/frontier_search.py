@@ -24,6 +24,30 @@ UNKNOWN = -1
 # cells around a frontier reach ~80-95, real walls 99-100.
 WALL_MIN = 90
 
+# Occupancy at which a cell blocks *line of sight*, as opposed to at
+# which it counts as a wall.
+#
+# These are two different questions and one constant cannot answer
+# both. Growing unknown space toward free space has to be permissive,
+# or the fog band covering a corridor's opening stops the unknown from
+# ever reaching a free cell and the corridor is never offered. Asking
+# whether a barrier stands between a goal and the unknown it claims has
+# to be strict, or a half-observed wall blocks nothing and the frontier
+# in one corridor points at unknown in the next one.
+#
+# Fog therefore has to count as passable for the first and as a barrier
+# for the second. Measured on two captured maps at dilation 4, sweeping
+# a single shared threshold:
+#
+#   occupied_min   corridor behind fog found   through-wall goal gone
+#             50               no                      yes
+#             75               no                      yes
+#             82               no                      partly
+#             90              yes                       no
+#
+# No value satisfies both, which is what forced the split.
+LOS_WALL_MIN = 65
+
 
 @dataclass
 class Frontier:
@@ -182,13 +206,28 @@ def frontier_sees_unknown(
     This checks a straight line from the cell to each nearby unknown
     cell; the frontier counts only if some line stays wall-free.
 
-    ``occupied_min`` must describe a *wall*, not merely "probably not
-    free". Around a frontier the partially-observed cells run to a
-    median of ~80, while solid maze walls sit at 99-100; a threshold of
-    65 blocks every ray on fog alone and rejects all frontiers, ending
-    exploration prematurely. Erring high is also the safer direction:
-    admitting a false frontier costs one visit and is then blacklisted
-    on arrival, whereas rejecting a real one can end the mission.
+    ``occupied_min`` here is deliberately *lower* than the value used
+    to decide what counts as a wall elsewhere (see ``LOS_WALL_MIN``
+    against ``WALL_MIN``). A ray only has to be plausibly obstructed to
+    make a frontier unmappable from this side, and a wall the vehicle
+    has seen once from a distance sits in the fog band while still
+    being perfectly solid.
+
+    The earlier reasoning here -- that erring high is safer, since a
+    false frontier costs one visit while rejecting a real one can end
+    the mission -- still applies, and this test can still suppress a
+    cluster outright: ``find_frontiers`` drops a frontier when no
+    candidate cell passes. What changed is that the threshold no longer
+    also decides where the unknown region may grow, so tightening it
+    stopped being the same thing as blinding the detector.
+
+    Measured on run 75's map at dilation 4 with the dilation mask held
+    at WALL_MIN, tightening this to 65 dropped 8 of 12 clusters, and
+    every one of them sat hard against an outer wall (y ~ +/-7, +/-9.9)
+    or across the interior wall at y = -3.5 -- the unclearable wall-fog
+    frontiers that cost three arrivals each before being blacklisted.
+    The four kept were interior, including the corridor a shorter
+    dilation could not see at all.
     """
     r0, c0 = cell
     rows, cols = grid.shape
@@ -224,8 +263,16 @@ def find_frontiers(
     min_goal_clearance: float = 0.0,
     max_goal_candidates: int = 40,
     face_unknown_radius: int = 0,
+    los_occupied_min: int = None,
 ) -> List[Frontier]:
-    """Detect and cluster frontiers on an occupancy grid."""
+    """Detect and cluster frontiers on an occupancy grid.
+
+    ``occupied_min`` decides what stops the unknown region growing and
+    what counts as a wall for clearance. ``los_occupied_min`` decides
+    what blocks a sight line, and should be lower -- see LOS_WALL_MIN.
+    Defaults to ``occupied_min`` so existing callers are unchanged.
+    """
+    los_min = occupied_min if los_occupied_min is None else los_occupied_min
     mask = detect_frontier_cells(
         grid,
         free_max=free_max,
@@ -260,7 +307,7 @@ def find_frontiers(
         for idx in order[:max_goal_candidates]:
             cell = tuple(int(v) for v in f.cells[idx])
             if not require_line_of_sight or frontier_sees_unknown(
-                grid, cell, occupied_min=occupied_min,
+                grid, cell, occupied_min=los_min,
                 window=unknown_dilation + 5,
             ):
                 # Visibility is judged at the frontier cell; the goal

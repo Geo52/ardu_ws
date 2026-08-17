@@ -779,6 +779,74 @@ one that seems most likely.
 
 ---
 
+## 29. One constant answering two questions, for the fourth time
+
+**Symptom.** Watching run 77: "it's using a frontier marker in
+corridor 2 to map corridor 1." Goals dispatched into an
+already-mapped corridor, pointing at unknown space on the far side of
+the wall beside it. Arrive, frontier survives, three arrivals, blacklist.
+
+**Cause.** `unknown_dilation` is 4 and the maze walls are 4 cells
+thick (entry 23), so unknown in one corridor reaches exactly far
+enough to touch free space in the next. The line-of-sight filter
+exists to reject precisely this — but it took its wall threshold from
+the same `occupied_min` as everything else, 90, and a wall the vehicle
+has seen once from a distance sits in the fog band well below that.
+It blocks no ray, so the false frontier survives.
+
+**Why no threshold fixed it.** Sweeping the shared constant at
+dilation 4, against two captured maps holding the two failure cases:
+
+| `occupied_min` | corridor behind fog found | through-wall goal gone |
+|---|---|---|
+| 50 | no | yes |
+| 65 | no | yes |
+| 75 | no | yes |
+| 82 | no | partly |
+| 90 | **yes** | **no** |
+
+Nothing satisfies both, because the constant is being asked two
+incompatible questions. *Growing* unknown toward free space must be
+permissive or the fog band over a corridor's opening stops the unknown
+from ever reaching a free cell. *Testing whether a barrier stands
+between a goal and its unknown* must be strict or a half-seen wall
+blocks nothing. Fog has to count as passable for one and as a barrier
+for the other.
+
+**Fix.** Split them: `LOS_WALL_MIN = 65` for the ray test,
+`WALL_MIN = 90` everywhere else, threaded through `find_frontiers` as
+`los_occupied_min`. With the dilation mask held at 90, tightening only
+the ray test to 65 dropped 8 of 12 clusters on run 75's map, and every
+one sat hard against an outer wall or across the interior wall at
+y = -3.5. The four that survived were interior, including the corridor
+a shorter dilation cannot see at all.
+
+**Result.** Run 78 mapped the maze complete in **25 goals** — the
+fewest of any run, against 35 and 51 for the same map — with **zero**
+frontiers dismissed after arrival, the signature this was aimed at. It
+needed no goal timeouts and no persistence dismissals at all; its 3
+aborts and 61 planner refusals all landed in the endgame, after the
+map was already complete, and belong to the inflation problem below.
+
+**The pattern, now four times over.** `occupied_min = 65` measuring
+distance to fog instead of wall (entry 18). `lethal_cost_threshold`
+asked to separate fog from wall when the data cannot (entries 24-27).
+Nav2's obstacle-layer height window written for a ground robot and
+applied to a flying one (entry 26). And this. Every time, a single
+number was serving two purposes that had quietly diverged, and every
+time the search for a better value failed because no value existed.
+When a sweep shows every setting failing in a different direction,
+stop sweeping and ask what two things the parameter is being asked to
+mean.
+
+**Still open.** `inflation_radius: 1.0` puts roughly a third of the
+navigable area at inscribed cost, and it is what the endgame refusals
+are. But the count across three runs of otherwise identical
+configuration went 112, 5, 61 — so it depends heavily on where the
+vehicle happens to finish, and one run's figure is not evidence.
+
+---
+
 ## Operational lessons
 
 **Orphaned processes are the sneakiest failure mode.** `ros2 launch`
