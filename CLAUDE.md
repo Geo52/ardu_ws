@@ -33,6 +33,10 @@ src/frontier_exploration/scripts/stop_run.sh
 
 # Localization sanity check, mid-run: Cartographer vs Gazebo ground truth.
 python3 src/frontier_exploration/scripts/drift_check.py
+
+# What is the live plan actually crossing? Settles "it's routing through
+# walls" in about 40 seconds (integration note 28).
+python3 src/frontier_exploration/scripts/plan_probe.py
 ```
 
 ### Tests
@@ -129,18 +133,28 @@ re-registers as "newly discovered" every cycle and holds the lead forever
 
 ## Working conventions in this repo
 
-- **`docs/INTEGRATION_NOTES.md` is the authoritative record** — 22 numbered
+- **`docs/INTEGRATION_NOTES.md` is the authoritative record** — 33 numbered
   entries, each a real failure with its symptom and fix. Read the relevant
   entry before touching SLAM config, Nav2 tuning, the DDS namespace, or
   the ranking rules; most of the non-obvious code exists because of one of
   them. `docs/PROJECT_REPORT.md` is the narrative companion.
 - **When a parameter sweep shows every value failing in a different
   direction, stop sweeping.** It means one constant is answering two
-  questions that have diverged. This has happened four times here
-  (integration notes 18, 24–27, 26, 29): distance-to-wall vs
+  questions that have diverged. This has happened five times here
+  (integration notes 18, 24–27, 26, 29, 32): distance-to-wall vs
   distance-to-fog, fog vs wall in the costmap, a ground robot's sensor
-  height applied to a flying one, and dilation reach vs sight line. Each
-  time the search for a better value failed because none existed.
+  height applied to a flying one, dilation reach vs sight line, and
+  straight-line vs travel distance in the goal commitment. Each time
+  the search for a better value failed because none existed.
+- **One run cannot validate a policy change; measure the decision
+  instead.** Four replicates of one config gave revisit rates of 0, 10,
+  33 and 54% and plan-failure counts of 4, 14, 29 and 43, while coverage
+  moved 0.9 m². Any single run supports whichever story you want. Either
+  measure a property of one *decision* against one map — what fraction
+  of this plan crosses unknown, how far must it fly to that candidate —
+  which settles from one sample, or normalise per unit of work
+  (seconds per frontier reached, not run duration) and pool four-plus
+  replicates. Integration note 33.
 - **Quote coverage with a ground-truth drift reading beside it.** The
   project's best result and its worst divergence (run 35, 332.9 m² of
   fabricated map) look identical on paper. `scripts/drift_check.py`.

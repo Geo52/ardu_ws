@@ -948,22 +948,62 @@ class Explorer(Node):
 
             # Honour the heading we were already committed to.
             #
-            # If the last goal was dropped because its area got mapped
-            # from a distance, the exploration has not failed -- it has
-            # advanced, and the frontier has receded deeper into the
-            # space just revealed. Prefer a candidate near where we
-            # were going, so the vehicle carries on into the unmapped
-            # region instead of turning round for closer fog. Only
-            # applies for one selection, and only if something is
-            # actually out that way.
+            # Set from both endings a goal can have. If it was dropped
+            # because its area got mapped from a distance, exploration
+            # has not failed -- it has advanced, and the frontier has
+            # receded deeper into the space just revealed. If it was
+            # reached, the same reasoning applies from where we stand.
+            # Either way, prefer a candidate near where we just were, so
+            # the vehicle carries on into the unmapped region instead of
+            # turning round for closer fog. Only applies for one
+            # selection, and only if something is actually out that way.
             if self._preempted_goal_xy is not None:
                 px, py = self._preempted_goal_xy
+                # "Onward" is measured in flight, not straight line.
+                #
+                # This was math.hypot, and in a maze the two diverge by
+                # exactly the amount that matters. Measured live on the
+                # decisions of one run:
+                #
+                #   (0.68,4.38)->(-0.43,6.43)   3.56 m -> hypot 2.33 m
+                #   (-4.40,-2.45)->(-2.75,0.70) 3.56 m straight,
+                #                              11.60 m actually flown
+                #
+                # The second sits inside commit_radius, so the straight
+                # line test called it "still onward" and committed --
+                # to a frontier three corridors over, reached by
+                # doubling back. That is the "it abandons a corridor
+                # half way down" symptom: the commitment fires and
+                # points the wrong way, which is worse than not firing,
+                # because it outranks the whole map for that selection.
+                #
+                # The rest of this method already ranks on BFS travel
+                # cost for this exact reason (travel_distances: "a
+                # frontier a few metres away through a wall can need a
+                # long detour"). This partition was the one place still
+                # asking the straight-line question.
+                #
+                # One extra BFS per preemption, ~6 ms on a full map.
+                pcell = (
+                    int((py - info.origin.position.y) / info.resolution),
+                    int((px - info.origin.position.x) / info.resolution),
+                )
+                rows, cols = grid.shape
+                if 0 <= pcell[0] < rows and 0 <= pcell[1] < cols:
+                    onward = travel_distances(
+                        grid, pcell, free_max=self._free_max
+                    )
+                else:  # preempted goal fell off the map; keep the old test
+                    onward = None
                 # Partition by index: these tuples hold Frontier
                 # objects whose numpy `cells` make `in` / `==`
                 # ambiguous.
                 near_idx, far_idx = [], []
                 for i, t in enumerate(tagged):
-                    d = math.hypot(t[3] - px, t[4] - py)
+                    if onward is None:
+                        d = math.hypot(t[3] - px, t[4] - py)
+                    else:
+                        d = onward[t[5].goal_cell] * info.resolution
                     (near_idx if d <= self._commit_radius else far_idx).append(i)
                 if near_idx:
                     self.get_logger().info(
@@ -1169,6 +1209,28 @@ class Explorer(Node):
             # it, and re-sending goals to it would loop forever.
             self._reached_goal_xy = self._current_goal_xy
             self._reached_at = self.get_clock().now()
+            # Anchor the next selection here too, not just on preemption.
+            #
+            # Arriving is the common ending -- 23 of 35 goals in run B,
+            # against 10 preemptions -- and it was the one ending that
+            # re-ranked the whole map from scratch with no memory of
+            # where the vehicle was. Depth-first then breaks ties on the
+            # newest-discovered frontier, and flying down one corridor
+            # continuously reveals openings into others, so the newest
+            # frontier is often a glimpse into a corridor the vehicle is
+            # not in. Measured over both runs, 26-29% of goal-to-goal
+            # transitions were jumps over 6 m, several of them 14-20 m:
+            # the corridor gets abandoned half explored and paid for
+            # again later.
+            #
+            # Anchoring on arrival asks the same question preemption
+            # already asked -- "is there anything still onward from
+            # here" -- and the partition is travel distance, so
+            # "onward" means a short flight, not a short straight line.
+            # It only reorders: with nothing within commit_radius the
+            # near set is empty and normal ranking applies unchanged,
+            # so this cannot strand the vehicle in a finished corridor.
+            self._preempted_goal_xy = self._current_goal_xy
             self._clear_goal()
         elif status == GoalStatus.STATUS_CANCELED:
             self._clear_goal()

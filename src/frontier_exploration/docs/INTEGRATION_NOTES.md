@@ -764,10 +764,40 @@ confident straight lines across regions it has never seen, and where a
 wall happens to stand in one, the path crosses it. On screen that is
 indistinguishable from ignoring a wall it can see.
 
-**Status.** Unresolved. `track_unknown_space: true` is the candidate,
-but frontier goals sit on the unknown boundary by definition, so the
-planner must still be permitted to enter unknown space or the run-71
-stranding returns in a new form.
+**Fix.** `track_unknown_space: true` on the global costmap, **paired
+with** the planner's existing `allow_unknown: true`. The pairing is the
+whole point. Alone, the first makes unknown untraversable and strands
+the vehicle at frontier goals, which sit on the unknown boundary by
+definition; alone, the second is inert, because with unknown written as
+`FREE_SPACE` there is no `NO_INFORMATION` in the costmap for it to
+permit. Together, `navfn` maps free space to `COST_NEUTRAL` 50 and
+unknown to `COST_OBS - 1` = 253, so unknown becomes *expensive rather
+than forbidden*: a known-free detour wins up to roughly five times the
+length, and a frontier goal on the boundary stays reachable.
+
+Measured on a live plan before and after, same maze, mid-run:
+
+```
+                    before          after
+known wall (>=90)     0   0.0%       0   0.0%
+fog (50-89)          14   1.1%       8   2.0%
+fog (26-49)         184  14.1%      24   6.1%
+UNKNOWN            *392* 30.0%     *9*  2.3%
+free                716  54.8%     354  89.6%
+```
+
+Late in a run the unknown share rises again (20.6% on one sample) and
+that is correct: by then the only frontiers left are in barely-mapped
+ground, so routing through unknown is the *only* way to reach them and
+`allow_unknown` permits exactly that. The invariant that holds
+throughout is the one that matters — **zero poses through a known
+wall**, before and after.
+
+**Cost, stated honestly.** Refusals do not go away. `GridBased: failed
+to create plan` still appears in the poorly-mapped south-east, 4 to 43
+times per run *on identical code* (see note 33). The vehicle survives
+them: goals are blacklisted and retried, and coverage lands at
+367.8–368.7 m² across five runs.
 
 **Lesson, and it cost four runs.** Two plausible mechanisms were
 available and both were real defects, so fixing them felt like
@@ -890,6 +920,141 @@ carries the vehicle past openings the first pass missed, so the
 apparently wasted tail is also the recovery mechanism for the
 limitation above. Measure what a phase is *for* before optimising it
 away.
+
+---
+
+## 31. The lateral axis had never been exercised, and enabling it crashed the vehicle
+
+**Symptom.** Three consecutive runs (82, 83, 84 by ArduPilot log
+number 97–99) died ~20 s after takeoff, each with
+`Crash: Disarming: AngErr=38-47>30` and `Accel` of 0.1–0.4. Per note
+12 that signature — large attitude error, low acceleration, no EKF
+chatter — is a wall strike, not a lost position solution.
+
+**What it was not.** The speed cap had been raised from 0.7 to 1.0 m/s
+in the same session and was the obvious suspect. It was not the cause:
+the log of the immediately preceding clean run shows the vehicle
+already flying at **1.04 m/s** with pitch tracking its demand to under
+a degree and altitude flat at 1.98 m. The crashing runs flew the same
+1.0 m/s. The single difference was `acc_lim_y`, raised 0.0 -> 2.5 in
+the same edit.
+
+**Cause, and why it hid for the whole project.** With `acc_lim_y: 0.0`
+DWB can never sample a lateral trajectory, so `vy` was pinned to
+*exactly* zero for every run this package has ever flown. The lateral
+command path was therefore never once exercised. Nav2 emits FLU body
+twists (y = left); `altitude_hold_relay` copies `linear.y` through
+untouched to AP_DDS. If ArduPilot reads that as FRD (y = right), every
+strafe drives into the wall it was avoiding. In the crash log,
+body-frame `vy` first becomes non-zero (-0.45 m/s) in the second
+before the vehicle drops out of the air:
+
+```
+t=30.5  alt 1.97  pitch  -0.1 / des  -0.1     vy ~0
+t=32.0  alt 1.98  pitch  -7.5 / des  -8.6     vy -0.45
+t=33.5  alt 0.27  pitch -60.9 / des -24.4     <- fallen
+```
+
+**Status.** `acc_lim_y` is back at 0.0 and the win it offers is real —
+without it every corner is stop-yaw-go — but it is gated on checking
+that sign convention on the bench, not on picking a better number.
+This resolves the second half of the open item in `PROJECT_REPORT.md`
+that read "one of the two is wrong in each case and it is not clear
+which": for `acc_lim_y` the *comment* is right about the physics and
+the *value* is right about this pipeline.
+
+**Lesson.** A parameter pinned at a value that disables a code path is
+not a tuned parameter, it is an untested branch wearing a number. The
+day it moves, everything downstream of it runs for the first time.
+
+---
+
+## 32. The commitment asked a straight-line question in a maze
+
+**Symptom.** "It goes half way down a corridor it has not mapped, then
+routes to a marker in another corridor." Watched, repeatedly.
+
+**Cause.** The guard against exactly this already existed — on
+preemption the explorer keeps the old goal as an anchor and prefers
+candidates near it — but it partitioned with `math.hypot`. Everything
+else in `_evaluate` ranks on BFS travel cost, for the reason
+`travel_distances` states in its own docstring: "a frontier a few
+metres away through a wall can need a long detour." The commitment was
+the one place still asking the straight-line question. Measured live
+on one run's decisions:
+
+```
+from            to               straight   flown
+(0.68, 4.38)    (-0.43, 6.43)      2.33      3.20   ok
+(-4.40,-2.45)   (-2.75, 0.70)      3.56     11.60   <- committed
+(-2.75, 0.70)   (-3.50,-6.50)      7.24     15.90
+```
+
+The middle row sits inside `commit_radius: 5.0`, so the straight-line
+test called an 11.6 m flight into another corridor "still onward" and
+committed to it. A *wrong* commitment is worse than none, because it
+outranks the whole map for that selection.
+
+**Fix.** One BFS from the anchor (~6 ms) and partition on
+`travel * resolution`. Verified on the next run's six commitments:
+straight/flown ratios of 1.0–1.37, every one a genuine same-corridor
+continuation, no mis-commit.
+
+**Note the units.** `travel_distances` returns *original-grid* cells —
+it multiplies by the downsample factor on the way out — so the
+conversion is `* resolution`, not `* resolution * downsample`. Getting
+this wrong doubles every distance and turns open corridors into
+apparent wall crossings.
+
+---
+
+## 33. One run cannot validate a policy change here
+
+**Symptom.** A change looked like a large win on one run and a
+regression on the next, on identical code.
+
+**The numbers.** Four replicates of one configuration, nothing
+differing between them:
+
+```
+run          revisit%   plan failures   mapped
+C               10%          29         368.7 m2
+D               33%          14         368.4 m2
+E               54%          43         367.8 m2
+F                0%           4         367.8 m2
+```
+
+Revisit rate spans 0–54% and refusals span 4–43 — an 11x range — while
+**coverage varies by 0.9 m² across five runs**. The report already said
+as much about refusals ("ranges 5 to 112 across runs that differ in
+nothing"); this is the same fact, met again, and it applies to every
+run-level count, not just that one.
+
+**What this cost.** A change was called a success on one run (revisit
+10% vs 50%), then a failure two runs later (33%, 54%), then neither.
+Both readings were a single sample. Pooling the replicates is what
+settled it:
+
+```
+no changes              jumps  7   returned  2   revisit 28.6%
++ arrival anchoring     jumps 36   returned 10   revisit 27.8%
+```
+
+**What did work.** Two habits, both of which sidestep run variance:
+
+*Measure the decision, not the run.* "What fraction of this plan's
+poses cross unknown" and "how far must the vehicle fly to that
+candidate" are properties of a single decision against a single map.
+They gave clean answers from one sample each, and are why notes 28 and
+32 are settled while the third change is not.
+
+*Normalise by work done, then pool.* Total run time did not separate
+the configurations — 571 s sits inside the 371–638 s spread of the
+others. Seconds **per frontier reached** did: 24.8 s against 16.1,
+19.3, 20.7 and 21.0, i.e. every replicate below the baseline. Suggestive,
+not established — the baseline is one run — but it is the metric to
+replicate, and it is the one that matches the complaint the work
+started from, which was about time.
 
 ---
 

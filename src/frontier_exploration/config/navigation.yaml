@@ -134,6 +134,37 @@ global_costmap:
       use_sim_time: *default_use_sim_time
       robot_radius: 0.35
       resolution: 0.05
+      # Unknown cells are recorded as NO_INFORMATION rather than being
+      # written into the costmap as FREE_SPACE.
+      #
+      # This is the fix for "it's routing through walls" (entry 28),
+      # and the symptom named the wrong thing. Sampling the live /plan
+      # against /map, twice, months apart:
+      #
+      #   run 74:  544 poses -- 0 through known wall, 221 unknown
+      #   later : 1306 poses -- 0 through known wall, 392 unknown
+      #
+      # Not one pose ever crossed a wall the map knew about. At the
+      # default false, unknown is written as FREE_SPACE 0, so the
+      # planner is not defying a wall -- it is being told the
+      # unexplored maze is confirmed-empty floor, and it draws
+      # confident straight lines across it. Where a wall happens to
+      # stand in one, the path crosses it, which on screen is
+      # indistinguishable from ignoring a wall it can see. This is why
+      # raising occupied_min never fixed it: the threshold was never
+      # the thing being consulted.
+      #
+      # Must stay paired with the planner's allow_unknown: true, which
+      # is inert until this is set -- there is no NO_INFORMATION in the
+      # costmap for it to permit. Together they make unknown expensive
+      # rather than forbidden: navfn maps free to COST_NEUTRAL 50 and
+      # unknown-with-allow_unknown to COST_OBS-1 = 253, so a known-free
+      # detour is preferred up to ~5x the length, while a frontier goal
+      # on the unknown boundary -- where every frontier goal sits by
+      # definition -- stays reachable. Setting this without
+      # allow_unknown strands the vehicle, which is the run-71 failure
+      # in a new form and the reason entry 28 was left open.
+      track_unknown_space: true
       # Occupancy at or above which a map cell becomes a lethal obstacle.
       #
       # This was 50, which is below Cartographer's fog. Measured on run

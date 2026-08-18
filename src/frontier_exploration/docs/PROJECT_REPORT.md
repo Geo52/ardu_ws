@@ -297,11 +297,13 @@ superseded by the runs in §5 and are marked as such.
 
 **What is still open**, in the order worth taking:
 
-- `track_unknown_space` defaults to false, so the planner treats
-  unexplored space as free and routes straight through it. Sampled on a
-  live plan: 221 of 544 poses crossed unmapped space, **zero** crossed a
-  known wall. This is what "it's routing through walls" actually was,
-  after two other explanations were tried and discarded.
+- ~~`track_unknown_space` defaults to false~~ — **fixed.** Set true,
+  paired with the planner's `allow_unknown: true` so unknown becomes
+  expensive (navfn cost 253 against free space's 50) rather than
+  forbidden. Plan poses crossing unmapped space fell from 30% to 2.3%,
+  with zero through a known wall before or after. Refusals in the
+  poorly-mapped south-east remain, and are survivable. Integration
+  note 28.
 - `large_frontier_cells: 400` has been inert since the dilation moved
   below 6, because clusters no longer reach that size. Recalibrate to
   the sizes the current detector produces, or delete it.
@@ -309,10 +311,25 @@ superseded by the runs in §5 and are marked as such.
   inscribed cost. Tempting, but the endgame refusal count it would be
   justified by ranges 5 to 112 across runs that differ in nothing, so
   there is no evidence to act on yet.
-- `acc_lim_x: 2.5` and `acc_lim_y: 0.0` in `navigation.yaml` each sit
-  beside a comment arguing for a different value (1.0, and non-zero for
-  a holonomic vehicle). One of the two is wrong in each case and it is
-  not clear which.
+- `acc_lim_y: 0.0` — **resolved, and it stays 0.0.** Raising it to 2.5
+  crashed the vehicle three runs out of three, ~20 s after takeoff,
+  each with the wall-strike signature. `vy` had been pinned at exactly
+  zero for the project's whole history, so the lateral command path had
+  never been exercised: Nav2 emits FLU body twists and they reach
+  AP_DDS unconverted. The comment is right about the physics, the value
+  is right about this pipeline, and the win — corners are stop-yaw-go
+  without it — is gated on checking that sign convention on the bench.
+  Integration note 31.
+- `acc_lim_x: 2.5` still sits beside a comment arguing for 1.0, and
+  that half is untested.
+- **Goal selection abandons a corridor part-way through**, reported
+  from watching and not yet isolated. The commitment logic was fixed to
+  measure "onward" in flight rather than straight line (note 32), and
+  extended to fire on arrival as well as preemption — the latter
+  triples how often it fires but shows no pooled effect (note 33).
+  Diagnosing the rest needs `/map` captured *at each goal dispatch*, so
+  the question "was a frontier still ahead when it left" can be asked
+  directly instead of inferred from where it flew next.
 
 **The real blocker was the exploration boundary, and it hid for six
 runs.** `bound_min_x = -9.5` on a maze whose free space reaches
